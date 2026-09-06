@@ -2,8 +2,8 @@ import { defineConfig } from 'vitepress'
 
 export default defineConfig({
   lang: 'zh-CN',
-  title: '浣熊智能巡检 · 面试速记',
-  description: '浣熊智能巡检 Java 项目面试复习文档',
+  title: '智能巡检项目',
+  description: '智能巡检项目 Java 面试复习文档',
   base: process.env.DOCS_BASE || '/',
   cleanUrls: true,
   lastUpdated: true,
@@ -15,7 +15,7 @@ export default defineConfig({
   ],
   themeConfig: {
     logo: '/logo.svg',
-    siteTitle: '面试速记',
+    siteTitle: '智能巡检项目',
     nav: [
       { text: '首页', link: '/' },
       { text: '面试文档', link: '/interview' }
@@ -70,7 +70,7 @@ export default defineConfig({
     },
     footer: {
       message: '用于个人项目面试复习',
-      copyright: '浣熊智能巡检'
+      copyright: '智能巡检项目'
     }
   }
 })

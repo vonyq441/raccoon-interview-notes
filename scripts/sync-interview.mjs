@@ -28,12 +28,18 @@ if (sourcePath === destinationPath || !destinationPath.startsWith(destinationDir
 
 const sourceContent = await readFile(sourcePath)
 
-// 本地开发时只从外层工作区导入，绝不向外层源文档回写。
-if (sourcePath === await realpath(workspaceSource).catch(() => '')) {
-  await writeFile(repositorySource, sourceContent, { flag: 'w' })
+async function writeIfChanged(path, content) {
+  const current = await readFile(path).catch(() => null)
+  if (current?.equals(content)) return
+  await writeFile(path, content, { flag: 'w' })
 }
 
-await writeFile(destinationPath, sourceContent, { flag: 'w' })
+// 本地开发时只从外层工作区导入，绝不向外层源文档回写。
+if (sourcePath === await realpath(workspaceSource).catch(() => '')) {
+  await writeIfChanged(repositorySource, sourceContent)
+}
+
+await writeIfChanged(destinationPath, sourceContent)
 const sourceContentAfterSync = await readFile(sourcePath)
 
 if (!sourceContent.equals(sourceContentAfterSync)) {

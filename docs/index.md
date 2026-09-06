@@ -2,8 +2,8 @@
 layout: home
 
 hero:
-  name: "浣熊智能巡检"
-  text: "项目面试速记"
+  name: "智能巡检项目"
+  text: "项目面试复习文档"
   tagline: "围绕真实业务场景，整理可直接口述的高频面试问答"
   actions:
     - theme: brand
