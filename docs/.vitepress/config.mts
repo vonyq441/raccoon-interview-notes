@@ -2,8 +2,8 @@ import { defineConfig } from 'vitepress'
 
 export default defineConfig({
   lang: 'zh-CN',
-  title: '智能巡检项目',
-  description: '智能巡检项目 Java 面试复习文档',
+  title: '项目面试文档',
+  description: '智能巡检与具身智能中央调度平台面试复习文档',
   base: process.env.DOCS_BASE || '/',
   cleanUrls: true,
   lastUpdated: true,
@@ -15,16 +15,23 @@ export default defineConfig({
   ],
   themeConfig: {
     logo: '/logo.svg',
-    siteTitle: '智能巡检项目',
+    siteTitle: '项目面试文档',
     nav: [
       { text: '首页', link: '/' },
-      { text: '面试文档', link: '/interview' }
+      { text: '智能巡检项目', link: '/interview' },
+      { text: '中央调度平台', link: '/central-scheduling' }
     ],
     sidebar: [
       {
-        text: '项目面试',
+        text: '智能巡检项目',
         items: [
           { text: '面试速记', link: '/interview' }
+        ]
+      },
+      {
+        text: '中央调度平台项目',
+        items: [
+          { text: '设计与面试准备', link: '/central-scheduling' }
         ]
       }
     ],
@@ -70,7 +77,7 @@ export default defineConfig({
     },
     footer: {
       message: '用于个人项目面试复习',
-      copyright: '智能巡检项目'
+      copyright: '项目面试文档'
     }
   }
 })
