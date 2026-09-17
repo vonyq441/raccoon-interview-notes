@@ -14,6 +14,11 @@ const documents = [
     workspace: resolve(siteRoot, '..', '甘肃具身智能示范应用-中央调度平台设计与面试.md'),
     repository: resolve(siteRoot, '中央调度平台设计与面试.md'),
     destination: resolve(siteRoot, 'docs', 'central-scheduling.md')
+  },
+  {
+    workspace: resolve(siteRoot, '..', '模拟面试记录.md'),
+    repository: resolve(siteRoot, '模拟面试记录.md'),
+    destination: resolve(siteRoot, 'docs', 'mock-interview.md')
   }
 ]
 

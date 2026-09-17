@@ -1,4 +1,5 @@
 node_modules/
 docs/interview.md
+docs/mock-interview.md
 docs/.vitepress/cache/
 docs/.vitepress/dist/

@@ -19,7 +19,8 @@ export default defineConfig({
     nav: [
       { text: '首页', link: '/' },
       { text: '智能巡检项目', link: '/interview' },
-      { text: '中央调度平台', link: '/central-scheduling' }
+      { text: '机器人中央调度项目', link: '/central-scheduling' },
+      { text: '模拟面试记录', link: '/mock-interview' }
     ],
     sidebar: [
       {
@@ -32,6 +33,12 @@ export default defineConfig({
         text: '中央调度平台项目',
         items: [
           { text: '设计与面试准备', link: '/central-scheduling' }
+        ]
+      },
+      {
+        text: '模拟面试记录',
+        items: [
+          { text: '按日期查看', link: '/mock-interview' }
         ]
       }
     ],
