@@ -20,6 +20,7 @@ export default defineConfig({
       { text: '首页', link: '/' },
       { text: '智能巡检项目', link: '/interview' },
       { text: '机器人中央调度项目', link: '/central-scheduling' },
+      { text: 'AI Agent 面试', link: '/ai-agent-interview' },
       { text: '模拟面试记录', link: '/mock-interview' }
     ],
     sidebar: [
@@ -33,6 +34,12 @@ export default defineConfig({
         text: '中央调度平台项目',
         items: [
           { text: '设计与面试准备', link: '/central-scheduling' }
+        ]
+      },
+      {
+        text: 'AI Agent 面试学习',
+        items: [
+          { text: '知识体系与高频题', link: '/ai-agent-interview' }
         ]
       },
       {
