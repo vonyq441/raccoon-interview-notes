@@ -266,6 +266,7 @@ Java 状态机取出当前步骤，向机器人下发导航或讲解命令。只
 
 - 接收机器人上传的文字问题及 `taskId、stepId、waypointId`；
 - 校验问题是否仍属于当前任务步骤；
+- 读取当前展台最近几轮对话，把“它有什么优势”改写成语义完整的问题；
 - 根据当前步骤得到 `exhibitCode`，限定专业知识库检索范围；
 - 将相关知识片段和问题组合后交给模型生成回答；
 - 返回回答和引用，但不修改任务步骤。
@@ -341,29 +342,82 @@ WAITING_COMMAND
 
 Java 先校验 `taskId` 是该机器人的当前任务、`stepId` 是当前执行步骤，并确认 `waypointId` 与步骤快照一致。如果机器人已经进入下一个展台，而旧问答仍携带上一个 `stepId`，平台就丢弃旧结果，避免在错误展台播放。
 
-校验通过后的 RAG 流程：
+`stepId` 不参与向量相似度计算，它承担两个职责：一是拦截上一个展台的过期请求，二是隔离不同展台的对话记忆。`exhibitCode` 才是缩小知识检索范围的主要条件。
+
+### 6.3 多轮追问与对话记忆怎样实现
+
+大模型本身不会自动记住上一轮对话。访客先问“液冷机柜怎么散热”，随后追问“它有什么优势”时，Java 平台需要把同一展台最近几轮消息重新提供给模型，才能理解“它”指的是液冷机柜。
+
+项目使用 Spring AI 的下列组件：
+
+- `ChatClient`：统一调用问答模型；
+- `MessageChatMemoryAdvisor`：调用模型前读取历史消息，调用完成后保存本轮消息；
+- `MessageWindowChatMemory`：只保留最近 6～10 条消息，避免上下文持续增长；
+- `RedisChatMemoryRepository`：让多个 Java 实例共享短期记忆，并通过 TTL 自动清理。
+
+会话编号按当前任务步骤隔离：
+
+```text
+conversationId = taskId + ":" + stepId + ":" + robotId
+```
+
+这样，同一展台内可以连续追问；进入下一展台后 `stepId` 改变，会自然切换到新的对话上下文，不会把液冷机柜的谈话带到具身智能展台。当前任务结束后，Redis 记忆可以立即清理，或再保留约 30 分钟后自动过期。
+
+需要区分三个容易混淆的概念：
+
+| 内容 | 保存位置 | 用途 |
+|---|---|---|
+| 对话记忆 | Redis 中最近几轮消息 | 提供给模型理解当前追问 |
+| 完整问答记录 | MySQL 业务表 | 页面查询、问题复盘和审计 |
+| 任务执行状态 | MySQL 任务、步骤和事件表 | 决定机器人当前执行到哪里 |
+
+`ChatMemory` 不能代替任务状态机。即使模型记得访客说过“去下一个展台”，Java 也必须依据当前任务状态重新校验，不能从聊天记录直接推进机器人。
+
+代码层面的关键不是手动拼接全部历史，而是在每次调用时传入正确的会话编号：
+
+```java
+ChatClient chatClient = ChatClient.builder(chatModel)
+        .defaultAdvisors(MessageChatMemoryAdvisor.builder(chatMemory).build())
+        .build();
+
+String answer = chatClient.prompt()
+        .user(question)
+        .advisors(a -> a.param(ChatMemory.CONVERSATION_ID, conversationId))
+        .call()
+        .content();
+```
+
+`conversationId` 必须由服务端根据当前任务生成，不能让不同机器人或不同接待任务共用一个固定值。
+
+带有多轮记忆的在线问答流程如下：
 
 ```text
 taskId + stepId
     ↓
-查询当前步骤，得到 exhibitCode
+校验当前步骤，并生成 conversationId
     ↓
-按 exhibitCode、公开权限和文档版本过滤知识 Chunk
+读取当前展台最近几轮对话
     ↓
-向量检索 TopK 相关 Chunk
+将“它有什么优势”改写成完整检索问题
     ↓
-问题 + 证据片段 + 回答约束组成 Prompt
+查询当前步骤得到 exhibitCode，并过滤知识 Chunk
+    ↓
+向量检索相关 Chunk
+    ↓
+原问题 + 对话上下文 + 证据片段组成 Prompt
     ↓
 中央问答 Agent 生成回答和引用
+    ↓
+再次校验 stepId 仍是当前步骤
     ↓
 bot_mind 通过 TTS 播放
     ↓
 任务继续保持 WAITING_COMMAND
 ```
 
-`stepId` 不参与向量相似度计算，它的作用是确认请求属于当前步骤；`exhibitCode` 才是缩小 RAG 召回范围的主要条件。
+不采用文章示例中的“本地文件 + Kryo”保存方式。本地文件适合单机学习项目，但不利于多实例共享、并发访问、自动过期和容器迁移；当前平台已经使用 Redis 保存短期状态，直接使用 Redis 会更自然。
 
-### 6.3 展厅知识库里具体放什么
+### 6.4 展厅知识库与元信息怎样设计
 
 知识库不保存机器人路线和控制命令，只保存经过审核、可用于现场回答的专业资料，主要包括：
 
@@ -371,40 +425,80 @@ bot_mind 通过 TTS 播放
 - 液冷机柜、算力网络、5G 和具身智能等展项的产品说明与技术白皮书；
 - 展示设备的公开参数、术语解释和演示边界；
 - 展厅运营人员整理并审核的 FAQ；
-- 文档的版本、生效状态、公开级别和适用展台。
+- 文档对应的展台、标题、章节和原始来源。
 
-管理员在 Java 平台上传 PDF、Word 或 Markdown。原文件保存到对象存储，入库任务完成文本提取、去页眉页脚、按标题和段落切块，再调用 Embedding 模型生成向量写入 PostgreSQL + pgvector。每个 Chunk 至少保存：
+当前只有十几个展台、二三十份资料，因此采用简单、可解释的入库流程：
 
 ```text
-chunkId、docId、title、section、exhibitCode、docType、
-visibility、version、effectiveStatus、content、embedding
+读取 PDF、Word 或 Markdown
+    ↓
+清洗页眉页脚、乱码和重复内容
+    ↓
+按标题、段落和语义切块
+    ↓
+添加确定性元信息与 AI 辅助关键词
+    ↓
+M3E 生成向量
+    ↓
+写入 PostgreSQL + pgvector
 ```
 
-这里优先按标题、段落和问答对切分，而不是机械地每隔固定字符截断，避免把“原理—参数—注意事项”拆散。文档更新时生成新版本，只有审核通过且生效的版本可以参与检索。
+元信息分成两类，不能全部交给大模型生成。
 
-### 6.4 在线问答怎样检索
+**确定性元信息**由上传页面和解析程序提供：管理员上传资料时必须选择所属展台，程序再记录来源文件、标题和页码。这些字段决定检索范围和引用来源，不能让模型猜测。
+
+```text
+chunkId、docId、exhibitCode、documentTitle、sectionTitle、
+pageNumber、sourceFile、content、embedding
+```
+
+**AI 辅助元信息**使用 Spring AI 的 `KeywordMetadataEnricher` 离线生成。它调用 `ChatModel` 分析每个文档块，将少量关键词写入 `excerpt_keywords`，例如：
+
+```json
+{
+  "exhibitCode": "LIQUID_COOLING",
+  "documentTitle": "液冷机柜讲解资料",
+  "pageNumber": 5,
+  "excerpt_keywords": "液冷机柜,冷却液,散热效率,节能"
+}
+```
+
+对应的处理代码可以概括为：
+
+```java
+KeywordMetadataEnricher enricher = KeywordMetadataEnricher.builder(chatModel)
+        .keywordCount(5)
+        .build();
+List<Document> enrichedChunks = enricher.apply(chunks);
+```
+
+关键词用于补充检索线索、后台搜索和结果展示，但不是主要过滤条件。因为资料量较小，`exhibitCode` 由人工选择比让模型自动判断更可靠；自动关键词应离线生成并抽样检查，不能为了“自动化”增加不可控错误。
+
+分块优先保持标题、段落和问答对完整，而不是机械地每隔固定字符截断，避免把“原理—参数—注意事项”拆散。
+
+### 6.5 在线问答怎样检索
 
 以“液冷机柜是怎么散热的”为例：
 
-1. Java 根据 `taskId + stepId` 得到当前 `exhibitCode=LIQUID_COOLING`。
-2. 先过滤当前展台、公开权限、已生效版本，避免检索到其他展台或内部维护资料。
-3. 将口语问题补全为“液冷机柜展台：液冷机柜通过什么方式散热”，但保留原问题供最终回答使用。
-4. 使用 pgvector 召回少量候选 Chunk；低于相似度阈值时返回“知识库暂无可靠资料”。
-5. 对候选内容去重，优先保留标题、章节和问题最匹配的 3～5 个片段。
-6. 将问题、当前展台、证据片段和回答约束组成 Prompt，生成简短口语回答及引用。
-7. Java 检查引用的 `chunkId` 是否属于本次检索结果，然后再次校验 `stepId` 是否仍为当前步骤。
+1. Java 根据 `taskId + stepId` 得到当前 `exhibitCode=LIQUID_COOLING`，并确认请求没有过期。
+2. 使用 `conversationId` 读取本展台最近几轮消息，将“它有什么优势”改写成“液冷机柜相比传统风冷有什么优势”。
+3. 先按 `exhibitCode` 过滤，只在当前展台的资料中检索，避免召回其他展项。
+4. 使用 pgvector 召回少量候选 Chunk。`TopK` 可以从 5 开始，再用标注问题集比较 Recall@K、答案忠实度和延迟进行调整，而不是声称存在固定最优值。
+5. 对候选内容去重，通常保留最相关的 3～5 个片段；没有可靠证据时返回“知识库暂无相关资料”。
+6. 将原问题、必要的对话上下文、当前展台、证据片段和回答约束组成 Prompt，生成简短口语回答及引用。
+7. Java 检查引用的 `chunkId` 是否属于本次召回结果，然后再次校验 `stepId` 是否仍为当前步骤。
 8. 校验通过后返回 bot_mind 播放，任务仍保持 `WAITING_COMMAND`。
 
 一期知识量和并发较小，不必同时部署 Elasticsearch、Milvus 和独立重排服务。pgvector 加元数据过滤已经能够完成核心问答；只有离线评测证明召回效果不足时，再增加关键词混合召回或专门的 Reranker。
 
-### 6.5 问答 Prompt 怎么设计
+### 6.6 问答 Prompt 怎么设计
 
 规划 Agent 与问答 Agent 必须使用不同 Prompt。问答 Prompt 可以采用下面的结构：
 
 ```text
 角色：你是展厅讲解问答助手。
 任务：根据给出的已审核资料，回答访客当前问题。
-上下文：当前展台、问题、证据片段及其 chunkId。
+上下文：当前展台、最近几轮必要对话、原始问题、改写后的检索问题、证据片段及其 chunkId。
 约束：
 1. 只能使用证据中的事实，不得补充未经支持的参数和结论；
 2. 证据不足或互相冲突时明确说明，不猜测；
@@ -416,19 +510,19 @@ visibility、version、effectiveStatus、content、embedding
 
 Prompt 的优化依靠固定问题集，而不是凭感觉反复改文字。问题集应包含正常问题、没有资料的问题、跨展台问题、带错误前提的问题、资料冲突问题和 Prompt 注入问题。每次调整分块、检索、模型或 Prompt 后，重新比较答案忠实度、引用准确率、无答案拒答率和延迟。
 
-### 6.6 项目怎样降低幻觉
+### 6.7 项目怎样降低幻觉
 
 - 路线规划只能选择工具返回的 `exhibitCode、waypointId、robotId`，Java 创建任务前再次查库校验；
-- 专业问答只使用审核通过、版本生效且权限允许的知识 Chunk；
+- 专业问答先按当前 `exhibitCode` 限定范围，再使用知识 Chunk；
 - 检索结果不足时拒答，不让通用模型凭参数记忆补全；
 - 输出包含引用，Java 校验引用必须来自本次召回结果；
 - 数字、型号和性能参数优先从结构化字段或原文证据读取；
 - 知识问答只返回 `KEEP_WAITING`，不能借回答结果推进任务或控制机器人；
-- 涉及内部数据、设备操作或无法确认的问题转交工作人员。
+- 涉及设备操作或无法确认的问题转交工作人员。
 
-因此，RAG 只能降低事实幻觉，真正阻止错误操作的仍是结构化输出、Java 规则校验、权限控制和任务状态机。
+因此，RAG 只能降低事实幻觉，真正阻止错误操作的仍是结构化输出、Java 规则校验和任务状态机。
 
-### 6.7 是否需要知识图谱
+### 6.8 是否需要知识图谱
 
 一期不引入 Neo4j。展厅问答主要是“某展项是什么、原理和优势是什么”，按 `exhibitCode` 过滤后检索文档即可。展台、楼层、waypoint、讲解稿和动作脚本之间的关系比较稳定，用 MySQL 外键和关联表表达更简单。
 
@@ -884,7 +978,7 @@ script：语音、动作、等待和其他命令组成的复合流程
 
 一期不需要为了“架构高级”引入 Kafka、Neo4j、Milvus、强化学习调度或大量微服务。机器人数量少、展台集合稳定时，模块化单体、MySQL、pgvector 和简单规则调度更容易开发、验证和维护。
 
-专业问答采用轻量 RAG：先按当前 `exhibitCode`、公开权限和文档版本过滤，再向量检索 TopK Chunk，最后把证据和问题交给中央问答 Agent。RAG 只负责回答临时问题，不负责决定机器人动作，也不影响固定文稿的正常播放。
+专业问答采用轻量 RAG：先校验当前 `stepId`，使用短期对话记忆补全追问，再按 `exhibitCode` 过滤并向量检索相关 Chunk，最后把证据和问题交给中央问答 Agent。RAG 只负责回答临时问题，不负责决定机器人动作，也不影响固定文稿的正常播放。
 
 ## 十七、简历内容对应到哪些实现
 
@@ -1039,35 +1133,47 @@ snapshot 是静态姿态，motion 是连续轨迹，script 是语音、动作、
 
 问答请求携带 `taskId、stepId、waypointId`。Java 校验 `stepId` 仍是当前步骤，回答生成完成后再次核对；如果任务已经推进，就丢弃旧回答。RAG 检索则使用当前步骤中的 `exhibitCode` 过滤知识范围。
 
-#### 21. 项目的 Prompt 是怎样优化的？
+#### 21. “它有什么优势”这样的连续追问怎样理解？
+
+大模型本身无状态。平台使用 `taskId:stepId:robotId` 作为 `conversationId`，由 `MessageChatMemoryAdvisor` 从 Redis 读取当前展台最近几轮消息，通过 `MessageWindowChatMemory` 控制窗口大小。系统先结合历史把追问改写成完整问题，再按当前 `exhibitCode` 检索资料。进入下一步骤后 `conversationId` 改变，旧展台的上下文不会串过来。
+
+#### 22. 为什么对话记忆放 Redis，不保存到本地文件？
+
+本地文件适合单机演示，但多实例之间不方便共享，也不利于并发、过期清理和容器迁移。Redis 能让多个 Java 实例读取同一会话，并设置 TTL。完整聊天记录另外写入 MySQL；ChatMemory 只保存模型当前需要的最近窗口，任务状态仍由业务表维护。
+
+#### 23. 项目怎样自动标注 RAG 元信息？
+
+元信息分两类。`exhibitCode、docId、页码、标题和来源文件`由上传页面和解析程序确定，不能让模型猜；`KeywordMetadataEnricher` 离线提取少量关键词写入 `excerpt_keywords`，用于辅助搜索和展示。当前资料只有二三十份，检索仍以人工选择的 `exhibitCode` 为主要过滤条件，AI 关键词只作补充并进行抽样检查。
+
+#### 24. 项目的 Prompt 是怎样优化的？
 
 规划和问答使用不同 Prompt。规划 Prompt 约束模型只能从工具返回的展台和机器人中选择，并用结构化 Schema 输出；问答 Prompt 只允许依据检索证据回答并返回引用。我们把线上和测试中出现的编造 ID、证据不足仍回答、跨展台串话等失败案例整理成固定回归集，每次修改 Prompt、模型或检索参数后重新测试，而不是只依靠人工观察几个答案。
 
-#### 22. 怎样解决大模型幻觉？
+#### 25. 怎样解决大模型幻觉？
 
-不能完全消除，只能分层降低。规划侧通过受控工具、结构化输出和 Java 二次查库防止编造资源；问答侧通过展台和权限过滤、审核版本、相似度阈值、证据不足拒答及引用校验降低事实幻觉；机器人控制侧不执行自然语言答案，只有通过任务状态和权限校验的正式命令才能下发。
+不能完全消除，只能分层降低。规划侧通过受控工具、结构化输出和 Java 二次查库防止编造资源；问答侧通过当前展台过滤、相似度阈值、证据不足拒答及引用校验降低事实幻觉；机器人控制侧不执行自然语言答案，只有通过任务状态校验的正式命令才能下发。
 
-#### 23. RAG 知识库的数据从哪里来？
+#### 26. RAG 知识库的数据从哪里来？
 
-来自审核后的讲解稿、FAQ、产品说明、公开技术白皮书和设备参数文档。原文件保存到对象存储，文本按标题和语义切块并写入 pgvector，每个 Chunk 携带展台、权限、版本和文档类型等元数据。检索时先过滤当前展台和生效版本，再做语义召回。
+来自讲解稿、FAQ、产品说明、公开技术白皮书和设备参数文档。原文件保存到对象存储，文本经过清洗并按标题和语义切块；程序添加 `exhibitCode、页码、标题和来源文件`，模型离线补充关键词，最后使用 M3E 生成向量写入 pgvector。查询时先按当前展台过滤，再做语义召回。
 
-#### 24. 为什么使用 pgvector，不用 Milvus？
+#### 27. 为什么使用 pgvector，不用 Milvus？
 
-展厅知识量和并发都不大，而且检索强依赖 `exhibitCode、visibility、version` 等结构化过滤。pgvector 可以复用 PostgreSQL 的 SQL、事务、备份和权限体系，部署成本更低。只有向量规模、并发或独立扩缩容需求明显增长并经过压测证明 PostgreSQL 无法满足时，才有必要迁移专用向量数据库。
+展厅只有二三十份资料，知识量和并发都不大，而且检索需要先按 `exhibitCode` 做结构化过滤。pgvector 可以复用 PostgreSQL 的 SQL、备份和运维体系，部署成本更低。只有向量规模、并发或独立扩缩容需求明显增长并经过压测证明 PostgreSQL 无法满足时，才有必要迁移专用向量数据库。
 
-#### 25. 项目为什么没有使用知识图谱？
+#### 28. 项目为什么没有使用知识图谱？
 
 一期问题主要来自单个展台的说明文档，关系也只是展台、楼层、waypoint、文稿和动作之间的简单关联，MySQL 关联表已经足够。只有出现设备拓扑、故障传播等真实多跳查询时，知识图谱才会带来明显价值。知识图谱不是 RAG 的必选组件。
 
-#### 26. 项目使用了什么 Embedding 模型？
+#### 29. 项目使用了什么 Embedding 模型？
 
 展厅知识库使用内网部署的 `moka-ai/m3e-base`，主要考虑中文语义检索效果、模型规模和数据不出内网。我们不是只根据公开榜单选型，而是使用展台 FAQ、同义问法和无答案问题组成验证集，对比 Recall@K、查询延迟和资源占用。需要注意，`m3e-base` 输出 **768 维**向量，因此 pgvector 字段和索引都使用 768 维。
 
-#### 27. 为什么不是 384 维？向量维度可以自己设置吗？
+#### 30. 为什么不是 384 维？向量维度可以自己设置吗？
 
 维度由 Embedding 模型决定，不能在数据库中随意指定。`m3e-base` 的隐藏维度是 768；Spring AI 默认 ONNX 示例中的 `all-MiniLM-L6-v2` 才是 384 维。如果把 M3E 的结果写入 `vector(384)` 会直接维度不匹配。除非额外训练或验证降维方案，否则项目应保持模型输出、数据库字段和索引维度一致。
 
-#### 28. 本地 M3E 怎样被 Spring AI 调用？
+#### 31. 本地 M3E 怎样被 Spring AI 调用？
 
 我们将 M3E 导出为 ONNX，把 `model.onnx` 和 `tokenizer.json` 部署到内网服务器，使用 Spring AI 的 `TransformersEmbeddingModel` 通过 ONNX Runtime 在 JVM 本地推理。业务代码只注入统一的 `EmbeddingModel` 接口，因此以后更换为 Ollama 或独立 Embedding 服务时，知识入库和检索业务不需要整体重写。
 
@@ -1084,23 +1190,23 @@ EmbeddingModel embeddingModel() {
 
 实际使用 Spring Bean 时由容器负责初始化和销毁；也可以通过 `spring.ai.embedding.transformer.*` 配置完成自动装配。
 
-#### 29. Spring AI 的哪个组件负责 Embedding 和向量检索？
+#### 32. Spring AI 的哪个组件负责 Embedding 和向量检索？
 
-`EmbeddingModel` 是统一的文本向量化接口，本地 ONNX 对应 `TransformersEmbeddingModel`；`VectorStore` 是统一的向量存储接口，项目使用 `PgVectorStore`。调用 `vectorStore.add(documents)` 时会对文档生成向量并入库；调用 `similaritySearch` 时会先对用户问题生成同一语义空间的向量，再执行 pgvector 相似度查询和 `exhibitCode、visibility、version` 元数据过滤。
+`EmbeddingModel` 是统一的文本向量化接口，本地 ONNX 对应 `TransformersEmbeddingModel`；`VectorStore` 是统一的向量存储接口，项目使用 `PgVectorStore`。调用 `vectorStore.add(documents)` 时会对文档生成向量并入库；调用 `similaritySearch` 时会先对用户问题生成同一语义空间的向量，再执行 pgvector 相似度查询和 `exhibitCode` 元数据过滤。
 
-#### 30. 为什么不单独写 Python 服务加载 M3E？
+#### 33. 为什么不单独写 Python 服务加载 M3E？
 
 Python + SentenceTransformers 服务当然可行，也适合统一使用 GPU 或供多个系统共享。但当前展厅知识量和并发不高，ONNX 直接在 Java 进程运行可以减少一个服务、一次网络调用和额外运维。如果后续多个业务系统共享模型、需要独立 GPU 扩缩容，再拆成独立 Embedding 服务更合理。
 
-#### 31. 如果以后更换 Embedding 模型，需要怎么迁移？
+#### 34. 如果以后更换 Embedding 模型，需要怎么迁移？
 
 不能直接复用旧向量。不同模型即使维度相同，语义空间也不同。系统记录 `embedding_model、embedding_version、dimension`，为新模型创建新表或新索引，对原始 Chunk 批量重新向量化；通过固定问题集比较召回效果，灰度切换查询流量，验证完成后再下线旧索引。
 
-#### 32. 怎样确认 M3E 真的适合展厅知识库？
+#### 35. 怎样确认 M3E 真的适合展厅知识库？
 
 从真实讲解问题中整理测试集，包括标准问法、口语改写、同义词、跨展台问题和知识库无答案问题，并为每个问题标注正确 Chunk。离线计算 Recall@K、MRR 和无答案过滤效果，再记录 P95 延迟和内存占用。只有它在这些指标上满足要求，才能说明选择合理，不能只说“中文模型效果好”。
 
-#### 33. 为什么官方示例直接 new TransformersEmbeddingModel，实际项目怎么写？
+#### 36. 为什么官方示例直接 new TransformersEmbeddingModel，实际项目怎么写？
 
 官方代码演示的是脱离 Spring 容器的手动使用，所以直接创建 `TransformersEmbeddingModel`，设置资源后调用 `afterPropertiesSet()`。真实 Spring Boot 项目通常通过配置自动装配，或者在 `@Configuration` 中把具体实现注册成 `EmbeddingModel` Bean。业务层只注入接口，不能直接实例化接口。
 

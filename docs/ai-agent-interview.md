@@ -452,6 +452,18 @@ EmbeddingModel m3eEmbeddingModel() {
 
 `PgVectorStore` 构造时注入这个 `EmbeddingModel`。调用 `vectorStore.add(documents)` 和 `similaritySearch(...)` 时，VectorStore 会分别完成文档和查询文本的向量化，业务代码通常不必手动调用 `embed()`。
 
+### 补21：Spring AI 怎样实现多轮对话和记忆持久化？
+
+**回答：** 大模型本身无状态，多轮对话的本质是应用在每次调用时重新提供相关历史。Spring AI 中，`MessageChatMemoryAdvisor` 在调用前根据 `conversationId` 读取历史消息，在调用后保存本轮消息；`MessageWindowChatMemory` 负责只保留最近若干条消息；底层由 `ChatMemoryRepository` 决定存到内存、JDBC 或 Redis。
+
+生产项目要把三类数据分开：ChatMemory 只保存当前模型需要的上下文；完整聊天历史单独写业务表用于页面展示和审计；任务状态由确定性状态机保存，不能因为聊天记录里出现过某句话就直接改变业务状态。机器人展厅项目可以使用 `taskId:stepId:robotId` 作为会话编号，将当前展台的多轮追问隔离开，并把 Redis 短期记忆设置 TTL。
+
+### 补22：RAG 元信息怎样自动标注？哪些字段不能交给模型？
+
+**回答：** 元信息分为确定性字段和 AI 辅助字段。文档 ID、业务分类、来源文件、标题、页码等决定过滤和引用的字段，应由上传页面或解析程序生成；关键词、主题摘要等软标签可以离线使用 `KeywordMetadataEnricher` 提取，并进行抽样检查。查询时先用可靠字段限定业务范围，再做向量检索，AI 关键词只用于增强搜索和展示，不能成为权限、安全或核心路由判断的唯一依据。
+
+在展厅项目中，管理员上传资料时选择 `exhibitCode`，程序记录页码和来源，`KeywordMetadataEnricher` 再补充 `excerpt_keywords`。这样既利用了自动标注，也避免模型把资料错误归到另一个展台。
+
 ---
 
 ## 九、结合你的项目怎么复习
@@ -476,8 +488,9 @@ EmbeddingModel m3eEmbeddingModel() {
 - [MCP](#q24)
 - [多 Agent 编排](#q32)与[A2A/MCP 协作](#q39)
 - [生产级架构](#q41)和[安全](#q42)
+- 多轮对话记忆、RAG 元信息标注与当前展台隔离
 
-可以这样联系项目：中央规划 Agent 负责理解接待需求、查询机器人与站点、生成任务计划；确定性任务引擎负责审核、状态流转和异常处置；机器人端只执行经过校验的导航、讲解和动作步骤。
+可以这样联系项目：中央规划 Agent 负责理解接待需求、查询机器人与站点、生成任务计划；确定性任务引擎负责审核、状态流转和异常处置；机器人端只执行经过校验的导航、讲解和动作步骤。领导在展台连续提问时，平台用步骤级 `conversationId` 读取短期记忆，再按当前 `exhibitCode` 检索知识库，回答完成后仍保持等待状态。
 
 ## 十、最小复习清单
 
