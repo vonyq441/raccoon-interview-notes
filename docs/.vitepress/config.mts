@@ -3,7 +3,7 @@ import { defineConfig } from 'vitepress'
 export default defineConfig({
   lang: 'zh-CN',
   title: '项目面试文档',
-  description: '智能巡检与具身智能中央调度平台面试复习文档',
+  description: '具身智能中央调度与 AI Agent 面试复习文档',
   base: process.env.DOCS_BASE || '/',
   cleanUrls: true,
   lastUpdated: true,
@@ -18,18 +18,11 @@ export default defineConfig({
     siteTitle: '项目面试文档',
     nav: [
       { text: '首页', link: '/' },
-      { text: '智能巡检项目', link: '/interview' },
       { text: '机器人中央调度项目', link: '/central-scheduling' },
       { text: 'AI Agent 面试', link: '/ai-agent-interview' },
       { text: '模拟面试记录', link: '/mock-interview' }
     ],
     sidebar: [
-      {
-        text: '智能巡检项目',
-        items: [
-          { text: '面试速记', link: '/interview' }
-        ]
-      },
       {
         text: '中央调度平台项目',
         items: [
