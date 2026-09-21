@@ -87,10 +87,24 @@ Agent 只决定本次是否选择这个展台以及它在路线中的位置。�
 │ 单机技能编排层    │  │ 单机技能编排层    │
 └────────┬─────────┘  └────────┬─────────┘
          ▼                     ▼
- bot_mind / G1ControlServer / g1_base / Unitree SDK
+ 每台机器人：bot_mind → g1_base（G1ControlServer + NavigationManager）→ 控制/导航与Unitree SDK
 ```
 
 ### 谁负责什么
+
+先看**包含关系**：`g1_base`是机器人侧的ROS 2功能包，不是与`G1ControlServer`并列的另一层。其`g1_base_manager`会在同一进程中启动`G1ControlServer`和`NavigationManager`两个节点；导航核心、动作控制和SDK桥接也位于该功能包中。`NavigationManager`负责定位/Nav2进程的启动与健康管理，不等于“导航算法本身”；Nav2等导航栈负责具体路径规划与避障。
+
+```text
+机器人侧
+├── ZeroClaw：语音意图与当前任务的本机编排（本项目集成设计）
+├── bot_mind：ASR/TTS、本机工具与G1ControlClient
+└── g1_base：ROS 2功能包
+    ├── g1_base_manager：统一启动入口
+    ├── G1ControlServer：导航Action、动作/停止/FSM Service、状态Topic
+    ├── NavigationManager：定位与Nav2运行管理、就绪/健康状态
+    ├── nav_core等：导航执行与机器人运动控制逻辑
+    └── UnitreeSdkBridge/worker：隔离硬件SDK调用
+```
 
 | 模块 | 负责 | 不负责 |
 |---|---|---|
@@ -101,17 +115,19 @@ Agent 只决定本次是否选择这个展台以及它在路线中的位置。�
 | 中央问答服务 | 专业问题做对话改写、RAG检索与证据回答；日常聊天不强制检索知识库 | 推进任务步骤 |
 | ZeroClaw任务执行 | 接收平台命令、编排本机技能、回传事件和断线收尾 | 绕开Java直接执行模型给出的导航目标 |
 | bot_mind | 唤醒、ASR、TTS及本机机器人能力适配 | 保存全局任务状态、决定下一站 |
-| G1ControlServer | 对导航、动作、FSM和停止提供统一入口 | 多机器人业务调度 |
-| g1_base | 定位、导航和避障 | 接待任务状态管理 |
-| Unitree SDK worker | 实际调用宇树硬件SDK执行动作 | 业务语义理解 |
+| `g1_base`（整个ROS 2功能包） | 容纳控制节点、导航管理、导航/运动逻辑和SDK桥接 | Java接待任务状态管理 |
+| ↳ `G1ControlServer`（包内节点） | 提供导航Action、动作/停止/FSM Service及运行状态Topic | 多机器人业务调度、独立实现全部导航算法 |
+| ↳ `NavigationManager`（包内节点） | 管理定位与Nav2进程生命周期，发布导航就绪/健康状态 | 选择参观路线、代替Nav2规划路径 |
+| ↳ `nav_core`及导航栈 | 执行导航、运动控制，并接入Nav2路径规划与避障 | 决定接待任务的下一个展台 |
+| ↳ `UnitreeSdkBridge/worker`（包内桥接） | 经独立Python子进程调用宇树硬件SDK | 业务语义理解 |
 
 ### ZeroClaw与Java的边界
 
 Java平台不应该把每个ROS2调用和硬件细节都远程编排。ZeroClaw部署在单台机器人上，是**唯一的机器人语音意图入口**：对固定短语做严格精确匹配，其余通过展厅服务器的Ollama模型分类，再把结构化意图交给Java；不会先由ZeroClaw自己的LLM判断一遍，再由Java的ChatClient判断一遍。它同时把“前往展台、播放讲解、执行动作、停止”封装成本地技能，并负责：
 
 - 将平台步骤转换成本地技能调用；
-- 识别语音意图并上传`taskId、stepId、planVersion`等上下文；
-- 组合bot_mind、G1ControlServer和动作脚本；
+- 识别语音意图并上传`taskId、stepId`等当前执行上下文；当前命令的`planVersion`可随事件回传，但机器人不维护完整路线版本；
+- 组合bot_mind提供的语音/本机工具能力，再经其ROS 2客户端调用`g1_base`内的`G1ControlServer`和动作脚本；
 - 在网络抖动时保证当前动作能够安全结束；
 - 汇总本机执行状态并上报平台。
 
@@ -129,6 +145,8 @@ ZeroClaw不替代`g1_base`，也不直接计算导航路径。它是单机器人
 - bot_mind和控制层提供本机能力，不能修改全局任务。
 
 因此，“去下一站”不是让机器人按本地`waypoints.yaml`寻找下一个点，而是请求Java推进当前任务，由Java返回任务计划中的明确`waypointId`。
+
+**如果ZeroClaw改接更大的模型，Java平台还有必要吗？** 有。模型大小影响理解、规划和回答质量，不会自动提供跨机器人的共享任务数据库、设备占用事务、人工审核、命令去重和执行审计。机器人侧的大模型可以提出“去液冷展台”的意图或规划建议，但接待模式下不能跳过Java任务接口直接占用机器人、改全局路线或调用导航。否则两台机器人可能各自认为同一资源可用，且断线后难以核对哪个计划已经执行。Java可以换成别的后端技术，**中心化业务事实和确定性执行边界**才是必须保留的；单机器人演示原型确实可以合并部分功能，不必夸称分层在任何规模下都必需。统一RAG问答也属于本项目的共享服务设计，而不是因为ZeroClaw的模型“不会回答”。
 
 **简历主线。** 简历优先讲Java业务平台、规划Agent、多机器人分配、执行跟踪和G1动作编排。RAG问答、多轮记忆、路线临时调整和断线恢复属于可以继续追问的扩展能力。这样既能说明平台完整，又不会让主线被大量Agent术语淹没。
 
@@ -176,7 +194,7 @@ WebSocket不是任务事实来源。平台先把命令写入数据库，再通�
                               ├→ Java advance接口
 bot_mind云端ASR → ZeroClaw精确短语或Ollama分类为NEXT → Java ┘
                                    ↓
-校验taskId、expectedStepId、planVersion和任务状态
+校验taskId、expectedStepId和任务状态
                                    ↓
 从已审核计划中确定下一TaskStep及waypointId
                                    ↓
@@ -184,9 +202,11 @@ bot_mind云端ASR → ZeroClaw精确短语或Ollama分类为NEXT → Java ┘
                                    ↓
 WebSocket通知机器人侧ZeroClaw
                                    ↓
-ZeroClaw调用bot_mind / G1ControlServer
+ZeroClaw调用bot_mind本机工具
                                    ↓
-g1_base执行导航，ZeroClaw持续回传执行事件
+bot_mind的G1ControlClient调用g1_base内的G1ControlServer
+                                   ↓
+g1_base导航/运动逻辑执行，ZeroClaw持续回传执行事件
                                    ↓
 Java更新命令与步骤状态
 ```
@@ -196,10 +216,10 @@ Java更新命令与步骤状态
 推进接口应携带调用方看到的任务上下文：
 
 ```text
-advance(taskId, expectedStepId, planVersion, requestId)
+advance(taskId, expectedStepId, requestId)
 ```
 
-`requestId`防止同一请求因网络重试被重复处理；`expectedStepId + planVersion + 当前状态`用于条件更新，防止手机点击和语音命令同时到达时连续跳过两个展台。
+`requestId`防止同一请求因网络重试被重复处理；`expectedStepId + 当前状态`用于条件更新，防止手机点击和语音命令同时到达时连续跳过两个展台。Java在事务中读取**当前**计划版本并确定下一站，语音端即使不知道管理员刚改过的未来路线，也不妨碍按新路线推进；管理员编辑计划时才使用`expectedPlanVersion`防止多人覆盖。
 
 **命令结构。** 平台明确指定要执行的目标点，不让机器人从本地列表猜测：
 
@@ -209,7 +229,7 @@ advance(taskId, expectedStepId, planVersion, requestId)
   "taskId": "T1001",
   "stepId": "T1001-S03",
   "robotId": "G1-01",
-  "planVersion": 2,
+  "planVersion": 1,
   "type": "NAVIGATE",
   "payload": {
     "waypointId": "F1_WP_03"
@@ -218,7 +238,7 @@ advance(taskId, expectedStepId, planVersion, requestId)
 }
 ```
 
-`commandId`标识一次命令，`idempotencyKey`用于识别同一业务动作的重复下发，`planVersion`用于校验命令属于哪个计划版本。版本号本身不会自动同步：Java仍需完成版本通知和机器人确认，才能安全切换路线。
+`commandId`标识一次命令，`idempotencyKey`用于识别同一业务动作的重复下发，`planVersion`标记**这条命令**基于哪个计划版本。完整路线只由Java维护，机器人只接收当前命令；普通的未来路线调整不需要单独通知机器人“全局版本已改变”。若旧版本命令已经下发且受改线影响，则先取消/核对该命令，再发新版本命令。
 
 **命令状态与执行事件。** 下发成功、机器人接收和实际执行成功必须分开：
 
@@ -281,7 +301,7 @@ Java平台不扫描局域网寻找机器人，而是由机器人侧ZeroClaw中�
 
 需要区分“在线”和“可调度”：在线只说明机器人侧服务仍能与平台通信；只有同时满足机器人未禁用、bot_mind与导航服务就绪、当前空闲、电量达标且所在区域符合任务要求时，机器人才能进入调度候选集合。机器人可能在线但正在执行任务、电量过低或`g1_base`异常，此时都不能接收新任务。
 
-机器人重连后重新注册，并上报当前`taskId、stepId、commandId`和`planVersion`。Java平台先与数据库中的任务状态对账，再决定继续等待、补发尚未执行的命令或转人工处理，不能因为重连就直接重放全部旧命令。
+机器人重连后重新注册，并上报当前`taskId、stepId、commandId`及**该命令**的`planVersion`（如有）。Java平台先与数据库中的任务状态对账，再决定继续等待、补发尚未执行的命令或转人工处理，不能因为重连就直接重放全部旧命令；也不能要求机器人上报一份它从未保存过的完整路线版本。
 
 > 面试速记：机器人主动注册并建立WebSocket，定期发送业务心跳；Java用Redis TTL判断在线，用确定性条件判断是否可调度，重连后根据任务、步骤和命令编号完成状态对账。
 
@@ -325,10 +345,10 @@ Agent提供展台顺序草案；Java查库验证展台、点位、资源和机�
 POST /api/reception-tasks/T1001/advance
 Content-Type: application/json
 
-{"requestId":"REQ-02","expectedStepId":"T1001-S02","planVersion":1,"source":"VOICE","robotId":"G1-01"}
+{"requestId":"REQ-02","expectedStepId":"T1001-S02","source":"VOICE","robotId":"G1-01"}
 ```
 
-Java检查当前状态与版本、确定已审核计划中的下一步骤，落库`robot_command`，然后通过WebSocket向**指定机器人**发送前文的`NAVIGATE`命令。`requestId`防同一请求重试；即使手机和语音用了不同`requestId`，`expectedStepId + planVersion + 状态条件`仍阻止连续跳过两个站台。ZeroClaw应把数据库`waypointId`映射到本机导航工具接受的实际`waypoint_name`。
+Java在事务中检查当前步骤和状态，读取数据库中的**当前计划版本**，确定下一步骤并落库`robot_command`，然后通过WebSocket向**指定机器人**发送前文的`NAVIGATE`命令。`requestId`防同一请求重试；即使手机和语音用了不同`requestId`，`expectedStepId + 状态条件`仍阻止连续跳过两个站台。ZeroClaw应把数据库`waypointId`映射到本机导航工具接受的实际`waypoint_name`。
 
 **4. 到站后讲解：机器人回传 → Java/ZeroClaw编排 → `bot_mind`。** 到站的`SUCCEEDED`事件仍是**导航完成**，不是“讲解完成”。现有`bot_mind`中`navigate_to(waypoint_name)`只导航，`booth_show`另按**当前实际waypoint名称**读取`<展厅文稿目录>/<waypoint名称>.md`并播报。最直接的业务协议是Java收到导航完成事件后，再发一条讲解命令：
 
@@ -344,16 +364,16 @@ ZeroClaw确认当前点位匹配后调用本机`booth_show`工具，例如传入
 POST /api/robot/utterances
 Content-Type: application/json
 
-{"utteranceId":"U-01","robotId":"G1-01","taskId":"T1001","stepId":"T1001-S03","planVersion":1,"intent":"KNOWLEDGE_QA","text":"液冷机柜怎样散热？"}
+{"utteranceId":"U-01","robotId":"G1-01","taskId":"T1001","stepId":"T1001-S03","intent":"KNOWLEDGE_QA","text":"液冷机柜怎样散热？"}
 ```
 
 ```json
 {"utteranceId":"U-01","taskId":"T1001","stepId":"T1001-S03","action":"SPEAK","answer":"液冷系统通过冷却液带走设备产生的热量……","keepTaskState":"WAITING_COMMAND"}
 ```
 
-回答中的文字仅示意，真实答案要由本展台检索证据支持。播放前机器人再次比对`taskId、stepId、planVersion、utteranceId`；如果已经换站或这轮问题被新提问打断，就丢弃旧答案，不让它在下一展台播报。
+回答中的文字仅示意，真实答案要由本展台检索证据支持。播放前按`taskId、stepId、utteranceId`及当前任务状态判断是否仍可播报；如果已经换站或这轮问题被新提问打断，就丢弃旧答案。**仅修改未来路线而当前步骤未变时，不应因为全局`planVersion`递增就误丢弃当前展台的答案。**
 
-**6. 临时改线：工作人员 → Java → 机器人确认。** 例如跳过未开始的液冷站台：
+**6. 临时改线：工作人员 → Java保存新版本；必要时才协调机器人。** 例如跳过未开始的液冷站台：
 
 ```http
 POST /api/reception-tasks/T1001/route-revisions
@@ -362,7 +382,7 @@ Content-Type: application/json
 {"requestId":"REQ-03","expectedStepId":"T1001-S02","expectedPlanVersion":1,"instruction":"跳过液冷，先去具身智能展台"}
 ```
 
-Java让规划Agent生成草案并校验，工作人员确认后保存`planVersion=2`；通知机器人新版本，并**等待机器人确认当前已到安全边界、接受新版本**，才下发下一条新路线命令。例如机器人回传`{"type":"PLAN_VERSION_ACCEPTED","taskId":"T1001","robotId":"G1-01","planVersion":2,"currentStepId":"T1001-S02"}`。不能仅靠HTTP修改成功就认定机器人已切换。事件回传、心跳和重连报文可直接参考本章前面的JSON示例，不为同一消息重复定义另一套字段。
+如果管理员在页面直接拖动后续展台顺序，就由Java校验并保存；只有自然语言改线才需要规划Agent生成草案。Java在事务中校验`expectedPlanVersion=1`，保留已完成步骤和历史版本，把未开始路线保存为`planVersion=2`。**当前没有受影响的已下发命令时，无需通知ZeroClaw整条新路线**：它仍在当前展台等待，下一次`NEXT`请求到来时，Java从版本2取下一站并下发当前命令。若要改变已下发/正在执行的目标，先暂停并向机器人发送取消命令，核对停止结果后再发新命令；这里才需要机器人确认。事件回传、心跳和重连报文可直接参考本章前面的JSON示例。
 
 ## 四、路线规划与任务执行
 
@@ -422,16 +442,18 @@ PlanDraft draft = planningChatClient.prompt()
 
 再根据距离迎宾点、电量和当前负载评分。最终占用通过数据库事务或带版本号的条件更新完成，避免两个任务同时抢到同一台机器人。
 
-**路线临时修改。** 工作人员可以通过手机或语音提出修改，规划Agent负责把自然语言转换成新的路线草案，但只能由Java校验、确认并创建新版本：
+**路线临时修改。** 工作人员可以直接在管理页面调整尚未执行的展台；这种明确编辑不需要重新调用规划Agent。语音提出“剩下十分钟，先讲具身智能”等模糊要求时，规划Agent只生成待确认的路线草案。两种入口都由Java校验、保存新版本：
 
 ```text
 planVersion=1：step3 → step4 → step5
 planVersion=2：step3 → step5
 ```
 
-一般改线在当前展台执行结束并进入`WAITING_COMMAND`后生效。Java暂停下发旧版本的后续命令，只修改尚未开始的步骤，保存新版本并通知ZeroClaw；ZeroClaw确认已经到达安全边界并接受新版本后，Java才下发新版本的下一条明确命令。
+一般改线在当前展台执行结束并进入`WAITING_COMMAND`后生效。Java保留已执行步骤及历史版本，只修改未开始的路线，并通过`expectedPlanVersion`做条件更新，避免两位管理员互相覆盖。完整计划只在Java保存；ZeroClaw不知道整条后续路线，因此**普通未来改线无须专门通知或等待机器人接受版本**。下一次`NEXT`到来时，Java读取新版本并只下发下一条明确命令。
 
-如果必须立即改线，要先取消或暂停当前命令并确认机器人已经停止。仅给命令增加`planVersion`并不能保证安全，因为新版本通知尚未到达时，机器人并不知道旧命令已经过期。影响较大的调整要求工作人员确认。
+`planVersion`的维护可以很简单：任务表只保存当前版本号，另存每次审核通过的路线快照/修改记录。提交时在同一数据库事务中执行“只有当前版本仍等于页面读到的版本才加一”，再保存未执行步骤的新快照；更新不到记录就提示管理员刷新，避免并发覆盖。机器人不参与这个版本号的递增。
+
+如果改线影响到已下发或正在执行的命令，要先暂停后续下发、取消受影响命令并确认机器人安全停止，再按新版本发下一条命令。仅在Java数据库中加一不能撤销机器人已经收到的动作；结果不明时转人工核对。影响较大的调整仍要求工作人员确认。
 
 ### 状态机与幂等
 
@@ -466,7 +488,7 @@ WAITING_COMMAND
 
 **幂等和超时。**
 
-- Java先用`requestId`识别同一入口请求的网络重试，再通过`expectedStepId + planVersion + 状态条件`防止两个不同请求连续推进；
+- Java先用`requestId`识别同一入口请求的网络重试，再通过`expectedStepId + 状态条件`防止两个不同请求连续推进；管理员编辑路线另用`expectedPlanVersion`做乐观并发控制；
 - 命令表对`commandId`建立唯一约束；事件表对`eventId`建立唯一约束，同一命令允许保存多条生命周期事件；
 - ZeroClaw保存`idempotencyKey`及对应执行状态，收到重复命令时返回已有状态，而不是再次执行；
 - 命令超时后标记为`UNKNOWN`并查询机器人当前状态，不能立即重复导航或动作；
@@ -478,7 +500,7 @@ WAITING_COMMAND
 
 ### 语音入口：ZeroClaw只判断一次，Java执行或回答
 
-bot_mind采集麦克风音频并调用云端ASR，把识别文字交给机器人侧ZeroClaw。ZeroClaw先将唤醒词、首尾空格和句末标点清理掉；若**完整文本**等于极少量预设短语，直接映射为意图；否则由ZeroClaw调用展厅本地服务器上的Ollama小模型分类**一次**。它把`utteranceId、taskId、stepId、planVersion、robotId、意图、原话`送给Java。Java不再另接一个小模型重复分类，只校验意图是否适用于当前任务，并处理规划、任务推进或回答。
+bot_mind采集麦克风音频并调用云端ASR，把识别文字交给机器人侧ZeroClaw。ZeroClaw先将唤醒词、首尾空格和句末标点清理掉；若**完整文本**等于极少量预设短语，直接映射为意图；否则由ZeroClaw调用展厅本地服务器上的Ollama小模型分类**一次**。它把`utteranceId、taskId、stepId、robotId、意图、原话`送给Java，不需要持有Java的完整路线版本。Java不再另接一个小模型重复分类，只校验意图是否适用于当前任务，并处理规划、任务推进或回答。
 
 **ZeroClaw的智能在哪里？** 它是机器人侧承接语音、调用模型、组织本机技能的运行层；Ollama上的Qwen是它接入的意图模型，不是与ZeroClaw并排运行的第二个意图Agent。当前`bot_mind`代码默认把ASR文本发给本机Rust服务，这支持“机器人侧先接收语音”的边界；但尚未看到Rust/ZeroClaw本体配置，因此“由它调用展厅Ollama并上报结构化意图”应作为本方案的接口设计，在联调中验证，不应冒充已有源码事实。
 
@@ -493,7 +515,7 @@ bot_mind采集麦克风音频并调用云端ASR，把识别文字交给机器人
 
 模型调用次数也由此清晰：精确“下一站”是零次模型调用；非精确流程指令只由ZeroClaw调用一次小模型；专业问题和日常聊天各调用一次小模型做分类，再由Java按需调用一次大模型生成内容。这里没有“ZeroClaw先找自己的另一个LLM想一遍，Java再找Ollama判断一遍”的重复路径。
 
-**停止指令单独处理。** 云端ASR若返回与“停下”等预设停止短语完全相等的文本，ZeroClaw优先触发本机停止能力并向Java上报，不等待Ollama或远端模型；手机停止按钮也直接走控制接口。由于语音识别依赖云端，这不是物理急停的替代品，还要保留机器人原有安全机制。其余未精确命中的语音才进入小模型；即便白名单命中`NEXT`，Java仍须检查任务是否运行、当前步骤是否处于`WAITING_COMMAND`，以及`expectedStepId`和`planVersion`是否匹配。
+**停止指令单独处理。** 云端ASR若返回与“停下”等预设停止短语完全相等的文本，ZeroClaw优先触发本机停止能力并向Java上报，不等待Ollama或远端模型；手机停止按钮也直接走控制接口。由于语音识别依赖云端，这不是物理急停的替代品，还要保留机器人原有安全机制。其余未精确命中的语音才进入小模型；即便白名单命中`NEXT`，Java仍须检查任务是否运行、当前步骤是否处于`WAITING_COMMAND`，以及`expectedStepId`是否仍为当前步骤，然后从数据库的当前计划版本取下一站。
 
 本项目没有面向访客的多用户登录和角色权限体系，不把“识别出谁说的”作为推进任务的前提。展厅接待模式下，语音“下一站”被定义为可用的现场交互入口；这意味着访客也可能触发推进，应在交互规则中明确这一点。若某场接待只允许工作人员控制，可在手机端确认后再推进，但那是另一种可选流程，不是当前方案里每条语音都做用户权限校验。
 
@@ -508,7 +530,7 @@ ZeroClaw.onAsr(text, context):
   if exactStop(text): localStop(); reportStopToJava(); return
   if exactNext(text): decision = CONTROL/NEXT
   else: decision = ollamaClassify(text, context)  # 唯一一次意图模型调用
-  POST Java /robot/utterances {utteranceId, taskId, stepId, planVersion,
+  POST Java /robot/utterances {utteranceId, taskId, stepId,
                                robotId, text, decision}
 
 Java.onUtterance(event):
@@ -520,7 +542,7 @@ Java.onUtterance(event):
   UNKNOWN      -> askForClarification(event)
 ```
 
-机器人上传结构化意图时仍须校验JSON枚举值、文本长度和`taskId/stepId/planVersion`是否有效，`targetExhibitCode`只能用于生成改线草案，不能直接变成导航命令。白名单或模型输出的`CONTROL`都只表示“用户想做什么”；Java依据任务状态、当前步骤、计划版本和机器人安全条件决定“此刻能不能做”，不需要额外查询用户角色。“不要去下个站台”“为什么去下个站台”即使含有白名单短语，也因全文不相等而进入小模型，绝不能直接推进。模型输出的`confidence`不应当作可靠概率，歧义、互相矛盾或连续改线的请求应追问或让工作人员确认。Ollama异常或超时，只允许极少量精确白名单按同样业务校验执行；其余语音提示改用手机按钮，不扩大规则范围猜测用户意图。
+机器人上传结构化意图时仍须校验JSON枚举值、文本长度和`taskId/stepId`是否有效，`targetExhibitCode`只能用于生成改线草案，不能直接变成导航命令。白名单或模型输出的`CONTROL`都只表示“用户想做什么”；Java依据任务状态、当前步骤、数据库中的当前计划和机器人安全条件决定“此刻能不能做”，不需要额外查询用户角色。“不要去下个站台”“为什么去下个站台”即使含有白名单短语，也因全文不相等而进入小模型，绝不能直接推进。模型输出的`confidence`不应当作可靠概率，歧义、互相矛盾或连续改线的请求应追问或让工作人员确认。Ollama异常或超时，只允许极少量精确白名单按同样业务校验执行；其余语音提示改用手机按钮，不扩大规则范围猜测用户意图。
 
 为了证明路由可靠，准备带标签的现场语音样本：白名单原句、只差一个否定词的句子、疑问句、口音/ASR错误、跨展台追问、同时包含命令与问题的句子。分别统计白名单误命中率、小模型各类召回率、`NEXT`误触发率、澄清率和端到端P95时延；控制类以低误触发优先，不达标就限制语音控制范围。未命中白名单的语音由ZeroClaw使用小模型分类，Java不会再分类一次；只有规划、知识问答或日常对话才按需调用移动API生成内容。
 
@@ -541,7 +563,7 @@ Java校验当前任务和步骤
     ↓
 中央问答Agent依据证据生成答案和引用
     ↓
-再次校验任务状态、stepId和planVersion，避免旧回答串到下一展台
+再次校验任务状态、stepId和utteranceId，避免旧回答串到下一展台
     ↓
 ZeroClaw在实际播报前再次校验上下文，再调用bot_mind进行TTS
     ↓
@@ -712,22 +734,24 @@ stop_current_operation(reason)
 get_robot_state()
 ```
 
-这些能力底层调用bot_mind或G1ControlServer。是否使用MCP是实现选择，不影响Java平台与机器人之间的业务协议。
+这些能力由bot_mind提供本机工具入口，再由其`G1ControlClient`调用`g1_base`内的ROS 2接口；`G1ControlServer`是包内控制节点，不是另一个与`g1_base`平级的项目。是否使用MCP是实现选择，不影响Java平台与机器人之间的业务协议。
 
-**G1ControlServer。**
+**`g1_base`包内的`G1ControlServer`。**
 
 - 导航使用ROS2 Action：任务时间长，需要反馈、取消和最终结果；
 - 动作和FSM切换使用Service：请求较短，需要明确返回；
-- 机器人状态使用Topic：持续发布位置、姿态和运行状态。
+- `G1ControlServer`通过Topic发布控制活动状态；位置和姿态来自定位/导航相关Topic，不能混称为同一条状态Topic。
 
-导航和避障由团队已有的`g1_base`提供。项目负责接入导航结果，并协调导航、讲解和动作流程，不把导航算法作为个人实现。
+同包的`NavigationManager`负责定位/Nav2运行和就绪状态；`G1ControlServer`接收导航目标并调用包内导航/运动逻辑，底层导航栈负责路径规划与避障。项目负责接入导航结果，并协调导航、讲解和动作流程，不把团队的导航算法作为个人实现。
 
 **Unitree SDK隔离。**
 
-硬件SDK运行在独立Python worker中，主ROS2进程通过stdin/stdout JSON通信：
+`g1_base`内的`UnitreeSdkBridge`将硬件SDK调用隔离到独立Python worker，主ROS 2进程通过stdin/stdout JSON通信：
 
 ```text
-ZeroClaw → G1ControlServer → Python worker → Unitree SDK
+ZeroClaw → bot_mind工具/G1ControlClient
+         → g1_base.G1ControlServer → g1_base.UnitreeSdkBridge
+         → Python worker → Unitree SDK
 ```
 
 这样可以隔离SDK运行环境、进程崩溃和多实例初始化冲突，降低SDK异常对主控制进程的直接影响。但进程隔离不等于调用一定不会等待，仍需为IPC设置超时、进程存活检查和重启后的状态核对；也不能把“杀掉worker”直接等同于机器人已经安全停止。
@@ -749,11 +773,11 @@ script：语音、动作、等待等步骤的复合流程
 | Agent无法解析需求 | 回退标准路线或让工作人员补充信息 |
 | 没有空闲机器人 | 任务保持待分配，提示人工选择或稍后重试 |
 | WebSocket断开 | 不启动新步骤，重连后通过REST对账 |
-| 两个入口同时下一站 | Java通过expectedStepId、planVersion和状态条件更新，只允许一次推进 |
+| 两个入口同时下一站 | Java通过expectedStepId和状态条件更新，只允许一次推进；下一站取自当前计划版本 |
 | 命令重复 | ZeroClaw按idempotencyKey返回已有执行状态 |
 | 导航或动作超时 | 标记UNKNOWN，先查询机器人状态，再决定恢复或人工接管 |
-| 旧问答返回 | 校验任务状态、stepId和planVersion，过期结果不再播报 |
-| 计划版本过期 | 停止旧版本后续下发，机器人确认新版本后再执行新命令 |
+| 旧问答返回 | 校验任务状态、stepId和utteranceId；仅未来路线改版不应废弃当前展台答案 |
+| 计划版本过期 | Java不再下发旧版本未来命令；若旧命令已发出且受影响，先取消并核对结果，再发新命令 |
 | 知识库无可靠证据 | 明确拒答并提示咨询工作人员 |
 | 停止指令 | 识别后不经过LLM，机器人侧优先调用停止能力并上报平台 |
 
@@ -828,7 +852,7 @@ zeroclaw
 - 推进并发：手机和语音同时发出下一站请求时只能推进一次；
 - 命令幂等：同一命令重复下发时不能重复执行，事件重复和乱序不能回退状态；
 - 超时对账：覆盖已执行但结果丢失、未执行和无法确认三种情况；
-- 路线改版：旧版本在安全边界停止，新版本确认后再继续；
+- 路线改版：未来步骤直接切到新版本；已下发命令受影响时先取消、核对并在安全边界继续；
 - RAG评测：标准问法、同义问法、跨展台问题和无答案问题；
 - 机器人仿真：导航成功、失败、取消、断线重连和人工接管；
 - 联调：从自然语言创建任务直到机器人回传完成事件。
@@ -865,9 +889,11 @@ traceId、taskId、stepId、commandId、robotId、planVersion
 每台机器人
 ├── ZeroClaw
 ├── bot_mind
-├── G1ControlServer
-├── g1_base
-└── Unitree SDK worker
+└── g1_base（ROS 2功能包）
+    ├── g1_base_manager
+    ├── G1ControlServer
+    ├── NavigationManager + nav_core等导航/运动逻辑
+    └── UnitreeSdkBridge → Python worker → Unitree SDK
 ```
 
 Java平台、业务数据、知识库、M3E和Ollama部署在展厅本地服务器，所有机器人共享同一份任务与知识数据。这里有**三个不同的模型角色**：ZeroClaw通过展厅内网调用Ollama中的Qwen完成一次语音意图分类；Java调用本地M3E生成检索向量，它不生成文字回答；Java通过移动API调用DeepSeek-V4-Flash生成路线草案、改线草案、专业知识答案或日常聊天回复。日常聊天不默认检索展台RAG；只有`KNOWLEDGE_QA`才检索。Spring AI在Java侧配置M3E `EmbeddingModel`和移动API的`ChatModel/ChatClient`即可，**不再额外配置一个Java侧Ollama意图分类器**。Ollama的具体接入方式取决于机器人侧ZeroClaw配置能否使用该模型服务，应在实际联调时验证。[Spring AI模型接口文档](https://docs.spring.io/spring-ai/reference/api/chat/ollama-chat.html)。
@@ -880,7 +906,7 @@ DeepSeek-V4-Flash于2026年4月24日发布，项目若描述2026年2月至6月�
 
 > 这个项目面向展厅讲解和政务接待场景。展台导航点、讲解文稿和动作脚本提前配置，工作人员可以通过手机或机器人语音输入接待需求。Java中央平台使用Spring AI规划Agent，从已有展台中选择并排序路线，再由确定性调度器根据机器人楼层、在线状态、电量和占用情况完成分配，创建任务步骤并持续跟踪执行状态。
 >
-> 每台机器人部署ZeroClaw作为单机智能交互与技能编排层，通过REST和WebSocket接收平台下发的当前命令，调用bot_mind、G1ControlServer、g1_base和Unitree SDK完成导航、讲解及动作，并把执行事件回传平台。手机按钮直接进入Java业务接口；机器人语音先经云端ASR，ZeroClaw对极少量精确短语直接映射意图，其余调用展厅本地Ollama小模型分类一次，再把结构化意图交给Java。Java不重复分类：“下一站”由任务服务依据已审核路线推进；专业问题进入RAG问答，日常聊天由通用对话服务回答，改线才交给规划Agent生成草案。
+> 每台机器人部署ZeroClaw作为单机智能交互与技能编排层，通过REST和WebSocket接收平台下发的当前命令；它调用bot_mind本机工具，再经`G1ControlClient`调用`g1_base`包内的`G1ControlServer`、导航/运动逻辑和SDK桥接完成执行，并把事件回传平台。手机按钮直接进入Java业务接口；机器人语音先经云端ASR，ZeroClaw对极少量精确短语直接映射意图，其余调用展厅本地Ollama小模型分类一次，再把结构化意图交给Java。Java不重复分类：“下一站”由任务服务依据已审核路线推进；专业问题进入RAG问答，日常聊天由通用对话服务回答，改线才交给规划Agent生成草案。
 >
 > 我还负责G1动作编排和SDK隔离，使用Python worker封装Unitree SDK，设计snapshot、motion、script三层动作体系以及控制互斥和停止优先机制。项目最终打通了需求解析、任务规划、多机器人分配、单机执行、知识问答和状态反馈闭环。
 
@@ -924,11 +950,11 @@ M3E适合中文语义检索并可内网部署；`m3e-base`模型输出就是768�
 
 **9. 路线中途变化怎么办？**
 
-Agent生成路线草案，Java校验后创建新的planVersion并停止旧版本后续下发；ZeroClaw到达安全边界并确认新版本后，Java才下发新版本命令。
+管理员直接编辑未来路线时无需调用Agent；自然语言改线才由Agent生成草案。Java校验后创建新的`planVersion`，旧的未来步骤不再下发。机器人只接收当前命令，普通改线无需通知它整条新路线；已下发命令受影响时先取消并核对，再发新命令。
 
 **10. 手机和语音同时触发下一站怎么办？**
 
-两个入口统一调用Java推进接口。`requestId`处理同一请求的重试，Java再使用`expectedStepId + planVersion + 当前状态`做事务条件更新，所以两个不同请求同时到达也只能有一个推进成功。
+两个入口统一调用Java推进接口。`requestId`处理同一请求的重试，Java再使用`expectedStepId + 当前状态`做事务条件更新，所以两个不同请求同时到达也只能有一个推进成功；下一站取自数据库当前计划。
 
 **11. ZeroClaw和bot_mind有什么区别？**
 
@@ -936,7 +962,7 @@ ZeroClaw负责单机器人语音意图判断、技能编排和平台命令执行
 
 **12. 是否实现了导航和避障算法？**
 
-没有。导航和避障来自团队已有的g1_base；项目负责ROS2 Action接入、流程协同、动作控制和状态反馈。
+没有。`g1_base`是整个ROS 2功能包，其中的导航/运动逻辑及Nav2路径规划、避障由团队相关成员负责；我侧重包内控制接口与动作编排的集成，并处理Java任务流程协同和状态反馈。
 
 ### 一页速记
 
@@ -949,9 +975,9 @@ M3E ONNX：生成768维检索向量
 Java平台：校验、调度、状态、问答和审计
 ZeroClaw：单机器人技能编排、平台命令执行与事件回传
 bot_mind：语音输入输出与本机能力适配
-G1ControlServer：统一机器人控制入口
-g1_base：导航与避障
-Unitree worker：硬件动作执行
+g1_base：机器人ROS 2功能包，包含G1ControlServer、NavigationManager、导航/运动逻辑和SDK桥接
+G1ControlServer：g1_base包内统一控制节点；NavigationManager：包内定位/Nav2运行管理节点
+Unitree worker：由g1_base的SDK桥接拉起，执行底层硬件SDK调用
 ```
 
 整个项目最重要的原则是：
@@ -977,7 +1003,7 @@ G1-02 / T102 / S01 → 具身智能资料 → 答案发回G1-02
 
 `utteranceId`只是**每句语音的唯一编号**，不是自动排队器。项目要明确一种单机器人策略：正常追问按接收顺序排队处理、依次播报；若访客在回答中明确打断并提出新问题，则标记旧请求已被取代，旧答案即使后来返回也不再播报。若第二问中的“它”依赖第一问，还需按顺序维护对话上下文，不能让两个请求各自读取到不完整的历史。
 
-答案下发和播报前都要核对`taskId、stepId、planVersion`以及该机器人的当前`utteranceId/序号`；如果已换展台、任务已取消或旧问题被打断，丢弃过期答案。**同一机器人有序，不同机器人并行**，两者并不矛盾。
+答案下发和播报前都要核对`taskId、stepId`以及该机器人的当前`utteranceId/序号`；如果已换展台、任务已取消或旧问题被打断，丢弃过期答案。只改未来路线但未离开当前展台时，不因计划版本增加而丢弃有效答案。**同一机器人有序，不同机器人并行**，两者并不矛盾。
 
 ### 十台机器人是否要一台配一条Java线程
 
