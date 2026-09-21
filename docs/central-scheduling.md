@@ -14,9 +14,9 @@
 
 一个典型需求是：
 
-> 下午三点接待领导参观一楼，重点介绍液冷机柜和具身智能，控制在十五分钟左右。每个展台讲完后等待提问，最后引导领导前往二楼，由二楼机器人继续接待。
+> 2026年9月21日早上九点，管理员提出：今天下午三点接待领导参观一楼，重点介绍液冷机柜和具身智能，控制在十五分钟左右。每个展台讲完后等待提问，最后引导领导前往二楼，由二楼机器人继续接待。
 
-系统最终生成的不是一段自由文本，而是类似下面的任务：
+Agent先生成待审核的路线草案；管理员确认后，Java保存下午三点的预约。到场确认并实际分配机器人后，执行任务类似：
 
 ```text
 总任务 T1001
@@ -169,8 +169,8 @@ ReceptionTask
 | `exhibit` | exhibit_code、name、floor、waypoint_id | 展台配置 |
 | `explain_script` | script_code、exhibit_code、content | 固定讲解文稿 |
 | `action_script` | action_code、resource_path、fsm_required | 动作脚本 |
-| `reception_task` | task_id、status、plan_version、start_time | 总接待任务 |
-| `task_step` | step_id、task_id、sequence、robot_id、type、snapshot | 本次任务步骤快照 |
+| `reception_task` | task_id、status、plan_version、planned_start_at、actual_started_at | 预约时间与实际开始时间分开保存；任务状态在数据库中维护 |
+| `task_step` | step_id、task_id、sequence、robot_id、type、snapshot | 本次任务步骤快照；预约创建时robot_id可为空，实际分配后写入 |
 | `robot_command` | command_id、step_id、type、status、idempotency_key | 平台下发命令 |
 | `execution_event` | event_id、command_id、event_type、occurred_at | 机器人执行事件 |
 | `qa_message` | conversation_id、role、content、step_id | 完整问答记录 |
@@ -330,14 +330,14 @@ Java再调用`GET http://<G1-01内网地址>/data/import/JOB-01`，检查返回�
 POST /api/reception-tasks/plan
 Content-Type: application/json
 
-{"requestId":"REQ-01","requirement":"下午三点参观一楼，重点讲液冷和具身智能，约十五分钟"}
+{"requestId":"REQ-01","requirement":"2026年9月21日下午三点参观一楼，重点讲液冷和具身智能，约十五分钟"}
 ```
 
 ```json
-{"planId":"PLAN-01","status":"PENDING_REVIEW","steps":[{"sequence":1,"type":"VISIT_EXHIBIT","exhibitCode":"LIQUID_COOLING","waypointId":"F1_WP_03","robotId":"G1-01","explainScript":"EXPLAIN_LIQUID_COOLING_V1"}]}
+{"planId":"PLAN-01","status":"PENDING_REVIEW","plannedStartAt":"2026-09-21T15:00:00+08:00","steps":[{"sequence":1,"type":"VISIT_EXHIBIT","exhibitCode":"LIQUID_COOLING","waypointId":"F1_WP_03","explainScript":"EXPLAIN_LIQUID_COOLING_V1"}]}
 ```
 
-Agent提供展台顺序草案；Java查库验证展台、点位、资源和机器人占用。工作人员审核后，Java保存任务`T1001`及本次步骤快照；模型输出本身不能直接发给机器人。
+Agent提供展台顺序和时间草案；Java查库验证展台、点位、资源，并让管理员核对日期与时间。审核后，Java保存任务`T1001`、步骤快照和预约时间，状态为`SCHEDULED`；不在早上九点就占用下午三点要用的机器人，也不向ZeroClaw同步整条路线。接待前做就绪检查，访客到场后工作人员点击“开始接待”，例如`POST /api/reception-tasks/T1001/start`、请求体为`{"requestId":"REQ-START-01","expectedStatus":"READY"}`。Java再次确认机器人空闲并下发第一条命令。`plannedStartAt`是预约时间，不代表机器人已经启动；这里的`/api/...`仍是Java平台设计示例。
 
 **3. 手机或语音要求“下一站”：入口 → Java → ZeroClaw。** 手机直接请求推进；语音先由`bot_mind`转文字，ZeroClaw识别为`NEXT`后提交**同一业务动作**，例如：
 
@@ -399,18 +399,18 @@ Content-Type: application/json
     ↓
 Java校验展台、waypoint和脚本真实存在
     ↓
-Java调度器选择机器人
+管理员审核；Java保存预约时间和步骤快照
     ↓
-生成任务及步骤快照
+接待前检查就绪；到场确认时Java分配机器人并下发首条命令
 ```
 
-Agent负责路线语义，Java负责最终校验和机器人分配。这样既能处理自然语言，又不会让大模型决定并发占用和数据库事务。
+Agent负责路线与预约时间草案，Java负责最终校验；机器人在接待开始前重新检查并分配，而不是创建预约时提前数小时占用。这样既能处理自然语言，又不会让大模型决定并发占用和数据库事务。
 
 **Spring AI结构化输出。** 规划结果使用Java类型承接，而不是解析自由文本：
 
 ```java
 public record PlanDraft(
-        LocalDateTime startTime,
+        OffsetDateTime plannedStartAt,
         Integer expectedMinutes,
         List<PlannedExhibit> exhibits,
         String explanation) {}
@@ -430,9 +430,9 @@ PlanDraft draft = planningChatClient.prompt()
         .entity(PlanDraft.class, spec -> spec.validateSchema());
 ```
 
-模型只能从工具返回的`exhibitCode`中选择。`entity()`解决输出格式问题，不能证明业务内容正确，因此Java仍要逐项查库校验。
+模型只能从工具返回的`exhibitCode`中选择。`entity()`解决输出格式问题，不能证明业务内容正确，因此Java仍要逐项查库校验；还要让管理员核对“今天下午三点”解析出的具体日期、时区和时间。数据库统一保存对应的时间点，避免服务器时区变化造成误启动。
 
-**机器人选择。** Java调度器先过滤：
+**机器人选择。** 预约创建时可以查看候选机器人，但不提前占用；准备接待及工作人员确认开始时，Java调度器重新过滤：
 
 - 不在线的机器人；
 - 已经被其他任务占用的机器人；
@@ -440,7 +440,7 @@ PlanDraft draft = planningChatClient.prompt()
 - 电量低于任务安全阈值的机器人；
 - 缺少任务要求能力的机器人。
 
-再根据距离迎宾点、电量和当前负载评分。最终占用通过数据库事务或带版本号的条件更新完成，避免两个任务同时抢到同一台机器人。
+再根据距离迎宾点、电量和当前负载评分。真正开始时通过数据库事务或带版本号的条件更新占用机器人，避免两个任务同时抢到同一台机器人；二楼接力机器人也应在交接前再检查，而非早上一直锁定。
 
 **路线临时修改。** 工作人员可以直接在管理页面调整尚未执行的展台；这种明确编辑不需要重新调用规划Agent。语音提出“剩下十分钟，先讲具身智能”等模糊要求时，规划Agent只生成待确认的路线草案。两种入口都由Java校验、保存新版本：
 
@@ -458,14 +458,29 @@ planVersion=2：step3 → step5
 ### 状态机与幂等
 
 ```text
-CREATED → PLANNED → APPROVED → ASSIGNED → RUNNING
-                                              ├── PAUSED
-                                              ├── FAILED
-                                              ├── CANCELLED
-                                              └── COMPLETED
+CREATED → PLANNED → APPROVED → SCHEDULED → PREPARING → READY
+                                                   └→ PAUSED（就绪失败）
+READY --访客到场、人工确认--> RUNNING
+RUNNING → PAUSED / FAILED / CANCELLED / COMPLETED
 ```
 
-`PLANNED`表示Agent已经生成草案，`APPROVED`表示草案通过工作人员或业务规则审核；如果现场采用工作人员按时启动，就不额外设计自动定时状态。只有确认存在预约自动启动需求时，再增加`SCHEDULED`及到期检查机制。
+`PLANNED`是Agent草案，`APPROVED`是审核通过，`SCHEDULED`表示Java已保存预约时间；**到点不等于自动导航**。例如预约15:00，14:55进入`PREPARING`检查资源与候选机器人，成功后为`READY`并提醒工作人员；访客到场、工作人员点击开始后，Java再次校验并占用机器人，进入`RUNNING`、下发首条命令。访客迟到时保持`READY`等待；就绪检查失败则暂停并提示人工处理。
+
+预约时间由数据库驱动，不需要为每张工单写一条`@Scheduled`。一个固定频率的扫描器查询即将开始的预约；数据库条件更新负责防重：
+
+```java
+@Scheduled(fixedDelay = 10_000)
+public void prepareUpcoming() {
+    Instant cutoff = clock.instant().plus(Duration.ofMinutes(5));
+    for (Long taskId : taskMapper.findScheduledBefore(cutoff, 100)) {
+        if (taskMapper.claimPreparation(taskId, cutoff) == 1) {
+            preparationService.checkResourcesAndNotifyStaff(taskId);
+        }
+    }
+}
+```
+
+启用Spring定时调度后，`claimPreparation`执行类似`UPDATE reception_task SET status='PREPARING' WHERE task_id=? AND status='SCHEDULED' AND planned_start_at<=?`；更新行数为1才继续检查，避免扫描重复或多实例同时准备。检查后写`READY`或`PAUSED`，**机器人调用不放在数据库事务内**。扫描器每次从数据库读取预约，重启后仍能恢复未处理任务；若进程在`PREPARING`中断，应按处理时间超时重新核对或提示人工处理，不能永远卡住。这里的`@Scheduled`只固定扫描频率，动态的“几点接待”来自工单数据；Spring也支持用`TaskScheduler.schedule(task, Instant)`按单个时间点注册一次任务，但单靠内存定时无法解决重启恢复。[Spring调度文档](https://docs.spring.io/spring-framework/reference/integration/scheduling.html)。
 
 **展台步骤状态。**
 
@@ -849,6 +864,7 @@ zeroclaw
 - 意图路由：先测精确白名单是否只命中整句（尤其是“不要去下个站台”等否定句），再用标注语料测试小模型对暂停、寒暄、知识追问、改线、ASR错误和歧义输入的分类；重点统计控制命令误触发率与端到端P95时延；
 - 规划校验：模型输出不存在的展台、超时路线和重复展台时必须拒绝；
 - 调度并发：两个任务不能占用同一机器人；
+- 预约启动：重启后仍能准备未处理任务，重复扫描只准备一次，访客迟到不自动导航，开始前重新校验机器人；
 - 推进并发：手机和语音同时发出下一站请求时只能推进一次；
 - 命令幂等：同一命令重复下发时不能重复执行，事件重复和乱序不能回退状态；
 - 超时对账：覆盖已执行但结果丢失、未执行和无法确认三种情况；
@@ -904,7 +920,7 @@ DeepSeek-V4-Flash于2026年4月24日发布，项目若描述2026年2月至6月�
 
 ### 九十秒项目介绍
 
-> 这个项目面向展厅讲解和政务接待场景。展台导航点、讲解文稿和动作脚本提前配置，工作人员可以通过手机或机器人语音输入接待需求。Java中央平台使用Spring AI规划Agent，从已有展台中选择并排序路线，再由确定性调度器根据机器人楼层、在线状态、电量和占用情况完成分配，创建任务步骤并持续跟踪执行状态。
+> 这个项目面向展厅讲解和政务接待场景。展台导航点、讲解文稿和动作脚本提前配置，工作人员可以通过手机或机器人语音输入预约接待需求。Java中央平台使用Spring AI规划Agent，从已有展台中选择并排序路线；审核后保存预约时间，接待前检查机器人就绪情况，访客到场后再分配并启动，随后持续跟踪执行状态。
 >
 > 每台机器人部署ZeroClaw作为单机智能交互与技能编排层，通过REST和WebSocket接收平台下发的当前命令；它调用bot_mind本机工具，再经`G1ControlClient`调用`g1_base`包内的`G1ControlServer`、导航/运动逻辑和SDK桥接完成执行，并把事件回传平台。手机按钮直接进入Java业务接口；机器人语音先经云端ASR，ZeroClaw对极少量精确短语直接映射意图，其余调用展厅本地Ollama小模型分类一次，再把结构化意图交给Java。Java不重复分类：“下一站”由任务服务依据已审核路线推进；专业问题进入RAG问答，日常聊天由通用对话服务回答，改线才交给规划Agent生成草案。
 >
