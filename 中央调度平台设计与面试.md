@@ -60,17 +60,21 @@ Agent 只决定本次是否选择这个展台以及它在路线中的位置。�
 项目采用“中央平台负责全局、ZeroClaw负责单机、控制层负责安全运动”的云边分层架构。
 
 ```text
-手机端 / 工作人员 / 机器人麦克风
-                  │
-                  ▼
+手机端/工作人员 ────────────────┐
+机器人麦克风 → bot_mind ASR     │
+                    ↓          │
+             ZeroClaw 意图识别   │
+             （调用本地Ollama）  │
+                    └──────────┤
+                               ▼
 ┌────────────────────────────────────────────┐
 │ Java中央平台                               │
 │ Spring Boot                                │
 │ ├── 接待任务与状态机                       │
 │ ├── 中央规划Agent                          │
 │ ├── 多机器人调度                           │
-│ ├── 本地Ollama意图路由与业务校验           │
-│ ├── 中央问答Agent与RAG                     │
+│ ├── 已识别意图的业务校验                   │
+│ ├── 中央问答Agent、日常对话与RAG           │
 │ └── 机器人连接、命令和事件中心             │
 └────────────────────┬───────────────────────┘
                      │ REST + WebSocket JSON
@@ -91,9 +95,9 @@ Agent 只决定本次是否选择这个展台以及它在路线中的位置。�
 | Java中央平台 | 保存任务事实、步骤状态、机器人占用、命令和事件，负责调度、路线变更与统一问答 | 关节控制、导航算法 |
 | 中央规划Agent | 理解接待需求，选择并排序已有展台 | 直接分配硬件资源、直接控制机器人 |
 | Java调度器 | 根据在线状态、楼层、电量和占用选择机器人 | 生成讲解内容 |
-| 语音意图路由 | 极少量精确短语直接映射动作，其余语音由Ollama小模型分类为控制、问答、闲聊或改线 | 自行决定目标点或执行硬件命令 |
-| 中央问答Agent | 对话改写、RAG检索、基于证据回答 | 推进任务步骤 |
-| ZeroClaw | 接收平台命令、编排本机技能、回传事件和断线收尾 | 修改全局路线、调度其他机器人 |
+| ZeroClaw语音路由 | 极少量精确短语直达，其余调用展厅服务器上的Ollama小模型，形成结构化意图 | 自行决定下一站目标点或修改全局任务 |
+| 中央问答服务 | 专业问题做对话改写、RAG检索与证据回答；日常聊天不强制检索知识库 | 推进任务步骤 |
+| ZeroClaw任务执行 | 接收平台命令、编排本机技能、回传事件和断线收尾 | 绕开Java直接执行模型给出的导航目标 |
 | bot_mind | 唤醒、ASR、TTS及本机机器人能力适配 | 保存全局任务状态、决定下一站 |
 | G1ControlServer | 对导航、动作、FSM和停止提供统一入口 | 多机器人业务调度 |
 | g1_base | 定位、导航和避障 | 接待任务状态管理 |
@@ -101,23 +105,24 @@ Agent 只决定本次是否选择这个展台以及它在路线中的位置。�
 
 ### ZeroClaw与Java的边界
 
-Java平台不应该把每个ROS2调用和硬件细节都远程编排。ZeroClaw部署在单台机器人上，把“前往展台、播放讲解、执行动作、停止”封装成本地技能，并负责：
+Java平台不应该把每个ROS2调用和硬件细节都远程编排。ZeroClaw部署在单台机器人上，是**唯一的机器人语音意图入口**：对固定短语做严格精确匹配，其余通过展厅服务器的Ollama模型分类，再把结构化意图交给Java；不会先由ZeroClaw自己的LLM判断一遍，再由Java的ChatClient判断一遍。它同时把“前往展台、播放讲解、执行动作、停止”封装成本地技能，并负责：
 
 - 将平台步骤转换成本地技能调用；
+- 识别语音意图并上传`taskId、stepId、planVersion`等上下文；
 - 组合bot_mind、G1ControlServer和动作脚本；
 - 在网络抖动时保证当前动作能够安全结束；
 - 汇总本机执行状态并上报平台。
 
 ZeroClaw不替代`g1_base`，也不直接计算导航路径。它是单机器人任务执行和技能编排层。
 
-平台与ZeroClaw之间使用业务协议即可，不强制使用MCP。当前规模下使用REST与WebSocket JSON更容易实现可靠下发和状态同步；ZeroClaw内部的机器人能力可以按工具或MCP Skill方式封装，供本机Agent调用。
+平台与ZeroClaw之间使用业务协议即可，不强制使用MCP。当前规模下使用REST与WebSocket JSON更容易实现可靠下发和状态同步；ZeroClaw内部的机器人能力可以按工具或MCP Skill方式封装，供本机Agent调用。接待模式下必须限制模型可直接调用的工具：它可以提交意图、请求播报或查询状态，但**不能凭模型判断直接调用本地“下一导航点”工具**。真正的目标`waypointId`仍由Java下发。
 
 **最终决定权。** 需要把“任务决策”和“动作执行”分开：
 
 
 - Java数据库中的任务、当前步骤和命令记录是业务事实来源；
 - 规划Agent只生成路线草案，Java校验并保存后才成为正式计划；
-- 手机和语音是输入入口，不能自行决定目标点；
+- 手机和语音是输入入口；ZeroClaw的小模型只识别意图，不能自行决定目标点；
 - ZeroClaw只执行Java明确下发的当前命令，不缓存并擅自推进整条路线；
 - bot_mind和控制层提供本机能力，不能修改全局任务。
 
@@ -167,7 +172,7 @@ WebSocket不是任务事实来源。平台先把命令写入数据库，再通�
 ```text
 手机点击“下一站” ─────────────┐
                               ├→ Java advance接口
-bot_mind云端ASR → ZeroClaw → Java精确短语直达或Ollama分类为NEXT ┘
+bot_mind云端ASR → ZeroClaw精确短语或Ollama分类为NEXT → Java ┘
                                    ↓
 校验taskId、expectedStepId、planVersion和任务状态
                                    ↓
@@ -390,80 +395,62 @@ WAITING_COMMAND
 
 ## 五、语音意图与展台知识问答
 
-### 语音入口：极窄白名单直达，其余交给本地小模型
+### 语音入口：ZeroClaw只判断一次，Java执行或回答
 
-bot_mind采集麦克风音频并调用云端ASR，ZeroClaw将识别文字与采集时绑定的`taskId、stepId、planVersion、robotId、utteranceId`上传给Java。语音分流分两步：**完整文本**在去除唤醒词、首尾空格和句末标点后，若与极少量预设短语完全相等，就直接映射到`NEXT`等动作；其余语音才调用展厅服务器上的Ollama小模型。这里不是搜索文本中是否“包含下一站”，更不是用一堆Java规则解释复杂语义。小模型只输出意图，不拥有硬件控制工具。
+bot_mind采集麦克风音频并调用云端ASR，把识别文字交给机器人侧ZeroClaw。ZeroClaw先将唤醒词、首尾空格和句末标点清理掉；若**完整文本**等于极少量预设短语，直接映射为意图；否则由ZeroClaw调用展厅本地服务器上的Ollama小模型分类**一次**。它把`utteranceId、taskId、stepId、planVersion、robotId、意图、原话`送给Java。Java不再另接一个小模型重复分类，只校验意图是否适用于当前任务，并处理规划、任务推进或回答。
 
-| 输入 | 小模型输出 | 后续处理 |
+**ZeroClaw的智能在哪里？** 它是机器人侧承接语音、调用模型、组织本机技能的运行层；Ollama上的Qwen是它接入的意图模型，不是与ZeroClaw并排运行的第二个意图Agent。当前`bot_mind`代码默认把ASR文本发给本机Rust服务，这支持“机器人侧先接收语音”的边界；但尚未看到Rust/ZeroClaw本体配置，因此“由它调用展厅Ollama并上报结构化意图”应作为本方案的接口设计，在联调中验证，不应冒充已有源码事实。
+
+| 输入 | ZeroClaw的判断 | Java后续处理 |
 |---|---|---|
 | “去下一个站台” | 精确白名单：`CONTROL / NEXT` | 跳过小模型；Java仍校验任务状态，再从已审核计划确定下一`waypointId` |
 | “下一站我们去哪里？” | 非精确匹配，进入小模型 | 当作提问或澄清，不能推进 |
 | “为什么下一站是液冷？” | `KNOWLEDGE_QA`或`UNKNOWN` | 回答或澄清，绝不凭“下一站”三个字推进 |
 | “液冷机柜怎样散热？” | `KNOWLEDGE_QA` | 进入RAG与中央问答Agent |
 | “先不看液冷，去具身智能” | `PLAN_CHANGE` | 大模型提出改线草案，工作人员确认、Java校验后才生效 |
-| “谢谢你” | `SMALL_TALK` | 简短固定话术或轻量回答，保持当前步骤 |
+| “谢谢你” | `SMALL_TALK` | 日常对话服务生成简短回复，不做展台RAG，保持当前步骤 |
 
-**停止指令单独处理。** 云端ASR若返回与“停下”等预设停止短语完全相等的文本，机器人侧优先触发本机停止能力并向Java上报，不等待Ollama或远端模型；手机停止按钮也直接走控制接口。由于语音识别依赖云端，这不是物理急停的替代品，还要保留机器人原有安全机制。其余未精确命中的语音才进入小模型；即便白名单命中`NEXT`，Java仍须检查任务是否运行、当前步骤是否处于`WAITING_COMMAND`，以及`expectedStepId`和`planVersion`是否匹配。
+模型调用次数也由此清晰：精确“下一站”是零次模型调用；非精确流程指令只由ZeroClaw调用一次小模型；专业问题和日常聊天各调用一次小模型做分类，再由Java按需调用一次大模型生成内容。这里没有“ZeroClaw先找自己的另一个LLM想一遍，Java再找Ollama判断一遍”的重复路径。
+
+**停止指令单独处理。** 云端ASR若返回与“停下”等预设停止短语完全相等的文本，ZeroClaw优先触发本机停止能力并向Java上报，不等待Ollama或远端模型；手机停止按钮也直接走控制接口。由于语音识别依赖云端，这不是物理急停的替代品，还要保留机器人原有安全机制。其余未精确命中的语音才进入小模型；即便白名单命中`NEXT`，Java仍须检查任务是否运行、当前步骤是否处于`WAITING_COMMAND`，以及`expectedStepId`和`planVersion`是否匹配。
 
 本项目没有面向访客的多用户登录和角色权限体系，不把“识别出谁说的”作为推进任务的前提。展厅接待模式下，语音“下一站”被定义为可用的现场交互入口；这意味着访客也可能触发推进，应在交互规则中明确这一点。若某场接待只允许工作人员控制，可在手机端确认后再推进，但那是另一种可选流程，不是当前方案里每条语音都做用户权限校验。
 
-意图分类建议使用Ollama中的`qwen3:4b-instruct-2507-q4_K_M`，它是非思考版约4B参数的模型，Ollama模型文件约2.5GB；这只是下载体积，运行内存还取决于上下文长度、并发和推理后端，不能据此声称一定能在低配服务器稳定低延迟运行。先在实际服务器上压测，再定超时和并发。模型与版本见[Ollama标签页](https://ollama.com/library/qwen3/tags)和[Qwen模型卡](https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507)。
+ZeroClaw调用的意图模型建议使用Ollama中的`qwen3:4b-instruct-2507-q4_K_M`，它是非思考版约4B参数的模型，Ollama模型文件约2.5GB；这只是下载体积，运行内存还取决于上下文长度、并发和推理后端，不能据此声称一定能在低配服务器稳定低延迟运行。先在实际服务器上压测，再定超时和并发。模型与版本见[Ollama标签页](https://ollama.com/library/qwen3/tags)和[Qwen模型卡](https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507)。
 
-运维上先在展厅服务器执行`ollama pull qwen3:4b-instruct-2507-q4_K_M`，仅让Java平台通过本机地址访问Ollama，不直接暴露推理端口给手机或机器人。生产配置还要限制输入长度与并发、设置较短超时和低温度，并记录模型标签及提示词版本，以便复现误判。是否满足现场交互速度，应以“云端ASR + 局域网传输 + Ollama分类”的端到端P95时延衡量，而不是只测模型推理时间。
+运维上先在展厅服务器执行`ollama pull qwen3:4b-instruct-2507-q4_K_M`，让ZeroClaw通过受限的展厅内网接口访问该模型；不要把Ollama推理端口直接暴露到公网或手机端。若Ollama只监听`127.0.0.1`，机器人无法跨机器访问，须经内网代理或受控网络地址提供服务。生产配置还要限制输入长度与并发、设置较短超时和低温度，并记录模型标签及提示词版本，以便复现误判。是否满足现场交互速度，应以“云端ASR + 局域网传输 + Ollama分类”的端到端P95时延衡量，而不是只测模型推理时间。
 
-Spring AI中给意图路由单独配置指向Ollama的`ChatModel/ChatClient`，规划与问答则指向移动提供的模型API。以下是**逻辑示意**，具体Bean命名与结构化输出调用以锁定的Spring AI版本为准：
+ZeroClaw侧是唯一的模型意图路由，Spring AI只在Java侧负责规划、专业问答与日常对话。以下是**接口伪代码**，用于讲清职责，不代表已看到ZeroClaw的Rust实现：
 
-```java
-enum IntentType { CONTROL, KNOWLEDGE_QA, SMALL_TALK, PLAN_CHANGE, UNKNOWN }
-record IntentDecision(IntentType type, String action, String query,
-                      String targetExhibitCode) {}
+```text
+ZeroClaw.onAsr(text, context):
+  if exactStop(text): localStop(); reportStopToJava(); return
+  if exactNext(text): decision = CONTROL/NEXT
+  else: decision = ollamaClassify(text, context)  # 唯一一次意图模型调用
+  POST Java /robot/utterances {utteranceId, taskId, stepId, planVersion,
+                               robotId, text, decision}
 
-private static final Set<String> EXACT_NEXT = Set.of("去下一个站台", "去下个站台");
-
-IntentDecision route(VoiceRequest request) {
-    String text = stripBoundaryPunctuation(request.text()); // 只清理首尾空格、标点，不删除“不/别”等否定词
-    if (EXACT_NEXT.contains(text)) {
-        return new IntentDecision(IntentType.CONTROL, "NEXT", null, null);
-    }
-    return classify(request); // 所有其他普通语音由本地Ollama判断
-}
-
-IntentDecision classify(VoiceRequest request) {
-    // intentChatClient仅连接本地Ollama，不注册导航或动作工具。
-    return intentChatClient.prompt()
-        .system("只判断意图，输出JSON。控制动作只允许NEXT/PAUSE/RESUME/REPEAT/FINISH；不确定返回UNKNOWN。")
-        .user("当前展台=" + request.exhibitCode()
-            + "，步骤状态=" + request.stepState()
-            + "，最近对话=" + request.shortHistory()
-            + "，用户原话=" + request.text())
-        .call().entity(IntentDecision.class);
-}
-
-void dispatch(VoiceRequest request, IntentDecision intent) {
-    switch (intent.type()) {
-        case CONTROL -> taskService.applyAllowedAction(request, intent.action());
-        case KNOWLEDGE_QA -> qaService.answer(request, intent.query());
-        case PLAN_CHANGE -> planService.createDraftForConfirmation(request, intent);
-        case SMALL_TALK -> speechService.replyWithoutAdvancing(request);
-        case UNKNOWN -> speechService.askForClarification(request);
-    }
-}
+Java.onUtterance(event):
+  checkCurrentTaskAndStep(event)   # 不重新分类
+  CONTROL/NEXT  -> advanceFromApprovedPlan(event)
+  KNOWLEDGE_QA -> ragQaAndReturnSpeech(event)
+  PLAN_CHANGE  -> planningAgentDraftThenConfirm(event)
+  SMALL_TALK   -> generalChatWithoutRag(event)
+  UNKNOWN      -> askForClarification(event)
 ```
 
-真正实现时仍须校验JSON枚举值、文本长度、`targetExhibitCode`是否存在，以及`taskId/stepId/planVersion`是否仍有效。白名单或模型输出的`CONTROL`都只表示“用户想做什么”；Java依据任务状态、当前步骤、计划版本和机器人安全条件决定“此刻能不能做”，不需要额外查询用户角色。“不要去下个站台”“为什么去下个站台”即使含有白名单短语，也因全文不相等而进入小模型，绝不能直接推进。模型输出的`confidence`不应当作可靠概率，歧义、互相矛盾或连续改线的请求应追问或让工作人员确认。Ollama异常或超时，只允许极少量精确白名单按同样业务校验执行；其余语音提示改用手机按钮，不扩大规则范围猜测用户意图。
+机器人上传结构化意图时仍须校验JSON枚举值、文本长度和`taskId/stepId/planVersion`是否有效，`targetExhibitCode`只能用于生成改线草案，不能直接变成导航命令。白名单或模型输出的`CONTROL`都只表示“用户想做什么”；Java依据任务状态、当前步骤、计划版本和机器人安全条件决定“此刻能不能做”，不需要额外查询用户角色。“不要去下个站台”“为什么去下个站台”即使含有白名单短语，也因全文不相等而进入小模型，绝不能直接推进。模型输出的`confidence`不应当作可靠概率，歧义、互相矛盾或连续改线的请求应追问或让工作人员确认。Ollama异常或超时，只允许极少量精确白名单按同样业务校验执行；其余语音提示改用手机按钮，不扩大规则范围猜测用户意图。
 
-为了证明路由可靠，准备带标签的现场语音样本：白名单原句、只差一个否定词的句子、疑问句、口音/ASR错误、跨展台追问、同时包含命令与问题的句子。分别统计白名单误命中率、小模型各类召回率、`NEXT`误触发率、澄清率和端到端P95时延；控制类以低误触发优先，不达标就限制语音控制范围。未命中白名单的语音由小模型分类，移动API中的较大模型才负责规划与知识生成，不需要两次大模型都参与每条“下一站”。
+为了证明路由可靠，准备带标签的现场语音样本：白名单原句、只差一个否定词的句子、疑问句、口音/ASR错误、跨展台追问、同时包含命令与问题的句子。分别统计白名单误命中率、小模型各类召回率、`NEXT`误触发率、澄清率和端到端P95时延；控制类以低误触发优先，不达标就限制语音控制范围。未命中白名单的语音由ZeroClaw使用小模型分类，Java不会再分类一次；只有规划、知识问答或日常对话才按需调用移动API生成内容。
 
 ### 问答调用链与多轮记忆
 
 ```text
 bot_mind完成ASR
     ↓
-ZeroClaw上传utteranceId、taskId、stepId、planVersion、robotId和文字
+ZeroClaw用本地Ollama模型识别KNOWLEDGE_QA，并上传意图、文字与任务上下文
     ↓
 Java校验当前任务和步骤
-    ↓
-本地Ollama判定为KNOWLEDGE_QA
     ↓
 读取当前展台最近几轮对话
     ↓
@@ -720,8 +707,8 @@ com.example.robot.platform
 │   └── RobotScheduler
 ├── interaction
 │   ├── InteractionController
-│   ├── InteractionRouter
-│   └── OllamaIntentClassifier
+│   ├── RobotUtteranceHandler
+│   └── GeneralChatService
 ├── knowledge
 │   ├── KnowledgeIngestService
 │   ├── QuestionRewriteService
@@ -737,6 +724,7 @@ com.example.robot.platform
 ```text
 zeroclaw
 ├── platform_client       # Java平台通信
+├── intent_router         # 精确短语 + 调用展厅Ollama小模型
 ├── task_runner           # 当前步骤执行
 ├── skill_registry        # 本地能力注册
 ├── skills
@@ -801,7 +789,7 @@ traceId、taskId、stepId、commandId、robotId、planVersion
 └── Unitree SDK worker
 ```
 
-Java平台、业务数据、知识库、M3E和Ollama部署在展厅本地服务器，所有机器人共享同一份任务与知识数据。这里有**三个不同的模型角色**：Ollama中的Qwen只做快速意图分类；M3E只生成检索向量、不生成文字回答；DeepSeek-V4-Flash通过移动提供的API负责路线草案、改线草案和知识回答。机器人侧保留语音交互和执行能力。Spring AI可以分别配置本地Ollama `ChatModel`、M3E `EmbeddingModel`和远端兼容接口的`ChatModel`，由业务服务注入各自的`ChatClient`，不要把三者混成“一个模型”。[Spring AI Ollama接入文档](https://docs.spring.io/spring-ai/reference/api/chat/ollama-chat.html)。
+Java平台、业务数据、知识库、M3E和Ollama部署在展厅本地服务器，所有机器人共享同一份任务与知识数据。这里有**三个不同的模型角色**：ZeroClaw通过展厅内网调用Ollama中的Qwen完成一次语音意图分类；Java调用本地M3E生成检索向量，它不生成文字回答；Java通过移动API调用DeepSeek-V4-Flash生成路线草案、改线草案、专业知识答案或日常聊天回复。日常聊天不默认检索展台RAG；只有`KNOWLEDGE_QA`才检索。Spring AI在Java侧配置M3E `EmbeddingModel`和移动API的`ChatModel/ChatClient`即可，**不再额外配置一个Java侧Ollama意图分类器**。Ollama的具体接入方式取决于机器人侧ZeroClaw配置能否使用该模型服务，应在实际联调时验证。[Spring AI模型接口文档](https://docs.spring.io/spring-ai/reference/api/chat/ollama-chat.html)。
 
 DeepSeek-V4-Flash于2026年4月24日发布，项目若描述2026年2月至6月的历程，应表述为**后期选型/接入**，不能说从项目启动就使用；而“移动提供的API支持该模型”属于当前项目设定，是否真实开放、网关的`modelId`、鉴权与网络路径须以实际分配为准。[DeepSeek官方发布说明](https://deepseek.com/en/news/v4-preview/)。ASR走云端，意图路由与Embedding在本地，规划/问答请求及检索片段会发送至移动API；这不是全链路离线部署，资料出域范围需按实际网关与保密要求核验。Ollama与M3E同机部署还要测CPU/GPU内存占用和高峰并发，不能只根据模型文件大小估计容量。
 
@@ -811,7 +799,7 @@ DeepSeek-V4-Flash于2026年4月24日发布，项目若描述2026年2月至6月�
 
 > 这个项目面向展厅讲解和政务接待场景。展台导航点、讲解文稿和动作脚本提前配置，工作人员可以通过手机或机器人语音输入接待需求。Java中央平台使用Spring AI规划Agent，从已有展台中选择并排序路线，再由确定性调度器根据机器人楼层、在线状态、电量和占用情况完成分配，创建任务步骤并持续跟踪执行状态。
 >
-> 每台机器人部署ZeroClaw作为单机技能编排层，通过REST和WebSocket接收平台下发的当前命令，调用bot_mind、G1ControlServer、g1_base和Unitree SDK完成导航、讲解及动作，并把接收、执行中和完成事件回传平台。手机按钮直接进入Java业务接口；机器人语音先经云端ASR，极少量完全匹配的固定短语可跳过模型，其余由本地Ollama小模型判断是控制、问答还是改线。“下一站”最终仍由Java根据已审核计划确定目标点，路线调整才重新进入规划流程。
+> 每台机器人部署ZeroClaw作为单机智能交互与技能编排层，通过REST和WebSocket接收平台下发的当前命令，调用bot_mind、G1ControlServer、g1_base和Unitree SDK完成导航、讲解及动作，并把执行事件回传平台。手机按钮直接进入Java业务接口；机器人语音先经云端ASR，ZeroClaw对极少量精确短语直接映射意图，其余调用展厅本地Ollama小模型分类一次，再把结构化意图交给Java。Java不重复分类：“下一站”由任务服务依据已审核路线推进；专业问题进入RAG问答，日常聊天由通用对话服务回答，改线才交给规划Agent生成草案。
 >
 > 我还负责G1动作编排和SDK隔离，使用Python worker封装Unitree SDK，设计snapshot、motion、script三层动作体系以及控制互斥和停止优先机制。项目最终打通了需求解析、任务规划、多机器人分配、单机执行、知识问答和状态反馈闭环。
 
@@ -819,11 +807,15 @@ DeepSeek-V4-Flash于2026年4月24日发布，项目若描述2026年2月至6月�
 
 **1. 为什么Java和ZeroClaw不合并？**
 
-Java负责全局业务一致性和多机器人调度；ZeroClaw靠近硬件，负责单机技能执行和断线收尾。分层后业务状态不会散落在每台机器人上，控制细节也不会侵入中央平台。
+Java负责全局业务一致性、多机器人调度与问答内容；ZeroClaw靠近机器人，负责单次语音意图判断、本机技能执行和断线收尾。分层后业务状态不会散落在每台机器人上，控制细节也不会侵入中央平台。
 
 **2. 怎样区分知识问题和控制命令？**
 
-精确匹配的停止短语由机器人侧优先处理，不等待LLM；极少量完整匹配的“去下一个站台”等短语可直接映射`NEXT`，其余语音由展厅服务器上的Ollama小模型结合当前展台、状态和短对话做结构化分类。白名单命中和模型分类都要经过Java的任务状态、当前步骤和计划版本校验，而不是做访客身份或角色权限校验；有歧义时追问澄清。手机按钮直接进入业务接口。
+精确匹配的停止短语由ZeroClaw优先处理，不等待LLM；极少量完整匹配的“去下一个站台”等短语可直接映射`NEXT`，其余语音由ZeroClaw调用展厅服务器上的Ollama小模型，结合当前展台、状态和短对话做**唯一一次**结构化分类。Java不再调用另一个意图模型，但仍检查任务状态、当前步骤和计划版本；有歧义时追问澄清。手机按钮直接进入业务接口。
+
+**为什么已有ZeroClaw，还要部署Ollama小模型？**
+
+ZeroClaw是机器人侧智能体运行与技能编排层，不等于模型本身；本方案让它使用Ollama提供的Qwen做意图识别。若ZeroClaw已经接入另一模型并能可靠完成相同分类，就不应再加第二个Ollama分类器。Java只接收结构化意图，不重复判断。
 
 **3. 为什么问答不会误触发机器人动作？**
 
@@ -859,7 +851,7 @@ Agent生成路线草案，Java校验后创建新的planVersion并停止旧版本
 
 **11. ZeroClaw和bot_mind有什么区别？**
 
-ZeroClaw负责单机器人技能编排和平台命令执行；bot_mind提供ASR、TTS及本机能力适配。Java保存全局任务事实并决定下一站，三者不能互相越权。
+ZeroClaw负责单机器人语音意图判断、技能编排和平台命令执行；bot_mind提供ASR、TTS及本机能力适配。Java保存全局任务事实并决定下一站，三者不能互相越权。
 
 **12. 是否实现了导航和避障算法？**
 
@@ -870,9 +862,9 @@ ZeroClaw负责单机器人技能编排和平台命令执行；bot_mind提供ASR�
 ```text
 规划Agent：理解需求，组合已有展台
 精确白名单：只让少量完整匹配的短指令跳过模型，不跳过业务校验
-本地Ollama：分类其余普通语音，不控制机器人
+ZeroClaw + 本地Ollama：对其余普通语音只分类一次，不直接控制导航目标
 M3E ONNX：生成768维检索向量
-移动API：生成规划草案与有证据的问答
+移动API：生成规划草案、专业问答与不走RAG的日常聊天
 Java平台：校验、调度、状态、问答和审计
 ZeroClaw：单机器人技能编排、平台命令执行与事件回传
 bot_mind：语音输入输出与本机能力适配
@@ -883,4 +875,4 @@ Unitree worker：硬件动作执行
 
 整个项目最重要的原则是：
 
-> 少量精确短语直达、其他语音由本地小模型分类，远端大模型负责规划与有证据的回答；Java负责业务确定性，ZeroClaw负责单机执行，机器人控制层负责最终安全。
+> ZeroClaw用少量精确短语或本地小模型完成唯一一次语音意图判断；Java负责全局任务决策、规划与问答内容；ZeroClaw执行Java下发的明确命令，机器人控制层负责最终运动安全。
