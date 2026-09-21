@@ -55,6 +55,8 @@
 
 Agent 只决定本次是否选择这个展台以及它在路线中的位置。机器人到达后播放的文稿和动作仍来自配置，不由大模型现场生成。
 
+文稿、导航点和动作资源在接待前同步到机器人端，**不是每创建一个接待任务就重新上传整套文稿**。本次任务只引用已经同步且验证可用的资源；具体导入报文见第三章“接口示例”。
+
 ## 二、总体架构与职责边界
 
 项目采用“中央平台负责全局、ZeroClaw负责单机、控制层负责安全运动”的云边分层架构。
@@ -282,6 +284,85 @@ Java平台不扫描局域网寻找机器人，而是由机器人侧ZeroClaw中�
 机器人重连后重新注册，并上报当前`taskId、stepId、commandId`和`planVersion`。Java平台先与数据库中的任务状态对账，再决定继续等待、补发尚未执行的命令或转人工处理，不能因为重连就直接重放全部旧命令。
 
 > 面试速记：机器人主动注册并建立WebSocket，定期发送业务心跳；Java用Redis TTL判断在线，用确定性条件判断是否可调度，重连后根据任务、步骤和命令编号完成状态对账。
+
+### 接口示例：把一场接待串起来
+
+下面统一使用任务`T1001`、机器人`G1-01`和液冷展台。**只有`bot_mind`的`/data/import`及其状态查询是现有源码中的接口**；其余`/api/...`路径、WebSocket报文和字段是Java平台与机器人团队约定的**设计示例**，用于理解职责，不是声称源码已有这些控制器。业务编码`F1_WP_03`也必须映射为机器人`waypoints.yaml`中的实际点位名，不能只把数据库ID原样交给导航工具。
+
+**1. 接待前同步资源：Java → 每台相关机器人的`bot_mind`。** 一个ZIP可包含`prefixpath.txt`、`document/液冷机柜.md`、`waypoints.yaml`和可选动作包；例如`prefixpath.txt`内容为`halls/gansu_5g_1f`。Java用HTTP multipart上传：
+
+```http
+POST http://<G1-01内网地址>/data/import
+Content-Type: multipart/form-data
+
+file = @gansu_5g_1f.zip
+```
+
+```json
+{"success":true,"job_id":"JOB-01","status":"processing","status_url":"/data/import/JOB-01"}
+```
+
+Java再调用`GET http://<G1-01内网地址>/data/import/JOB-01`，检查返回的`job.status`是否为`succeeded`以及各资源项结果；`202/processing`仅表示已接收，不能视为资源可用。分展厅ZIP负责落盘，**不自动切换机器人当前使用的展厅配置**；上线前还要核对运行时读取的文稿目录和导航点位是否指向同一展厅。多台机器人分别导入、分别确认。ZIP结构和异步状态查询来自`bot_mind`现有源码中的`data/IMPORT_API.md`及`src/api/data.py`，不把示例地址当作真实服务地址。
+
+**2. 工作人员提交需求：手机 → Java规划接口。**
+
+```http
+POST /api/reception-tasks/plan
+Content-Type: application/json
+
+{"requestId":"REQ-01","requirement":"下午三点参观一楼，重点讲液冷和具身智能，约十五分钟"}
+```
+
+```json
+{"planId":"PLAN-01","status":"PENDING_REVIEW","steps":[{"sequence":1,"type":"VISIT_EXHIBIT","exhibitCode":"LIQUID_COOLING","waypointId":"F1_WP_03","robotId":"G1-01","explainScript":"EXPLAIN_LIQUID_COOLING_V1"}]}
+```
+
+Agent提供展台顺序草案；Java查库验证展台、点位、资源和机器人占用。工作人员审核后，Java保存任务`T1001`及本次步骤快照；模型输出本身不能直接发给机器人。
+
+**3. 手机或语音要求“下一站”：入口 → Java → ZeroClaw。** 手机直接请求推进；语音先由`bot_mind`转文字，ZeroClaw识别为`NEXT`后提交**同一业务动作**，例如：
+
+```http
+POST /api/reception-tasks/T1001/advance
+Content-Type: application/json
+
+{"requestId":"REQ-02","expectedStepId":"T1001-S02","planVersion":1,"source":"VOICE","robotId":"G1-01"}
+```
+
+Java检查当前状态与版本、确定已审核计划中的下一步骤，落库`robot_command`，然后通过WebSocket向**指定机器人**发送前文的`NAVIGATE`命令。`requestId`防同一请求重试；即使手机和语音用了不同`requestId`，`expectedStepId + planVersion + 状态条件`仍阻止连续跳过两个站台。ZeroClaw应把数据库`waypointId`映射到本机导航工具接受的实际`waypoint_name`。
+
+**4. 到站后讲解：机器人回传 → Java/ZeroClaw编排 → `bot_mind`。** 到站的`SUCCEEDED`事件仍是**导航完成**，不是“讲解完成”。现有`bot_mind`中`navigate_to(waypoint_name)`只导航，`booth_show`另按**当前实际waypoint名称**读取`<展厅文稿目录>/<waypoint名称>.md`并播报。最直接的业务协议是Java收到导航完成事件后，再发一条讲解命令：
+
+```json
+{"commandId":"CMD-EXPLAIN-03","taskId":"T1001","stepId":"T1001-S03","robotId":"G1-01","type":"PLAY_EXPLANATION","payload":{"waypointId":"F1_WP_03"},"idempotencyKey":"T1001-S03-EXPLAIN"}
+```
+
+ZeroClaw确认当前点位匹配后调用本机`booth_show`工具，例如传入`{"user_text":"开始讲解展台"}`；该工具从机器人已导入的文稿目录读文件，并调用语音服务播报。另一种是机器人侧**新增**`VISIT_POINT`组合执行器，按“导航成功→调用`booth_show`→讲解结果回传”顺序执行，这样Java只需下发一次组合命令；但不能说现有`navigate_to`已经自动讲解。无论哪种方式，都分别记录导航与讲解结果，讲解结束后才进入`WAITING_COMMAND`。
+
+**5. 现场提问：ZeroClaw → Java问答 → 当前机器人。** 机器人侧将ASR文字和已分类意图上传，Java据`taskId/stepId`取得展台编码后检索：
+
+```http
+POST /api/robot/utterances
+Content-Type: application/json
+
+{"utteranceId":"U-01","robotId":"G1-01","taskId":"T1001","stepId":"T1001-S03","planVersion":1,"intent":"KNOWLEDGE_QA","text":"液冷机柜怎样散热？"}
+```
+
+```json
+{"utteranceId":"U-01","taskId":"T1001","stepId":"T1001-S03","action":"SPEAK","answer":"液冷系统通过冷却液带走设备产生的热量……","keepTaskState":"WAITING_COMMAND"}
+```
+
+回答中的文字仅示意，真实答案要由本展台检索证据支持。播放前机器人再次比对`taskId、stepId、planVersion、utteranceId`；如果已经换站或这轮问题被新提问打断，就丢弃旧答案，不让它在下一展台播报。
+
+**6. 临时改线：工作人员 → Java → 机器人确认。** 例如跳过未开始的液冷站台：
+
+```http
+POST /api/reception-tasks/T1001/route-revisions
+Content-Type: application/json
+
+{"requestId":"REQ-03","expectedStepId":"T1001-S02","expectedPlanVersion":1,"instruction":"跳过液冷，先去具身智能展台"}
+```
+
+Java让规划Agent生成草案并校验，工作人员确认后保存`planVersion=2`；通知机器人新版本，并**等待机器人确认当前已到安全边界、接受新版本**，才下发下一条新路线命令。例如机器人回传`{"type":"PLAN_VERSION_ACCEPTED","taskId":"T1001","robotId":"G1-01","planVersion":2,"currentStepId":"T1001-S02"}`。不能仅靠HTTP修改成功就认定机器人已切换。事件回传、心跳和重连报文可直接参考本章前面的JSON示例，不为同一消息重复定义另一套字段。
 
 ## 四、路线规划与任务执行
 
@@ -876,3 +957,32 @@ Unitree worker：硬件动作执行
 整个项目最重要的原则是：
 
 > ZeroClaw用少量精确短语或本地小模型完成唯一一次语音意图判断；Java负责全局任务决策、规划与问答内容；ZeroClaw执行Java下发的明确命令，机器人控制层负责最终运动安全。
+
+## 九、两台到十台机器人：并发问答怎么处理
+
+### 两台机器人同时提问
+
+假设G1-01在液冷展台回答“怎么散热”，G1-02在具身智能展台回答“机器人能做什么”。两台ZeroClaw分别上传自己的`robotId、taskId、stepId、utteranceId`和已识别的`KNOWLEDGE_QA`。Java问答服务是**同一套程序、两次独立调用**：每次依据所属步骤取得`exhibitCode`，检索该展台资料，再分别调用模型API并把答案发回对应机器人。不能把“当前机器人”“当前展台”放在问答服务的全局可变字段里。
+
+```text
+G1-01 / T101 / S05 → 液冷资料 → 答案发回G1-01
+G1-02 / T102 / S01 → 具身智能资料 → 答案发回G1-02
+```
+
+两台机器人可以同时等模型回答；一个机器人问答较慢，不应阻塞另一台的导航或问答。`conversationId = taskId:stepId:robotId`用于隔离短期对话记忆，但它**只负责隔离，不保证同一机器人连续提问的答案顺序**。
+
+### 同一机器人连续提问，为什么会乱序
+
+例如G1-01在同一个展台先问“液冷怎么散热”（`utteranceId=U1`，生成耗时5秒），一秒后又问“机柜尺寸是多少”（`U2`，生成耗时2秒）。如果两次请求直接并行，U2可能先返回；机器人若收到就播，会先回答第二问再回答第一问。
+
+`utteranceId`只是**每句语音的唯一编号**，不是自动排队器。项目要明确一种单机器人策略：正常追问按接收顺序排队处理、依次播报；若访客在回答中明确打断并提出新问题，则标记旧请求已被取代，旧答案即使后来返回也不再播报。若第二问中的“它”依赖第一问，还需按顺序维护对话上下文，不能让两个请求各自读取到不完整的历史。
+
+答案下发和播报前都要核对`taskId、stepId、planVersion`以及该机器人的当前`utteranceId/序号`；如果已换展台、任务已取消或旧问题被打断，丢弃过期答案。**同一机器人有序，不同机器人并行**，两者并不矛盾。
+
+### 十台机器人是否要一台配一条Java线程
+
+不需要。**一台机器人最多执行一个接待任务**是业务约束，不代表Java要为它永久分配一条线程。Java保存十条任务各自的状态和命令，按`robotId`定向下发；机器人导航时Java不一直等待，而是收到执行事件后再更新状态。问答请求到来时，Web服务短时处理这次调用；同步等待模型API会占用当次请求的处理线程，但不是整个接待过程都占着它。
+
+开始时可利用Web服务已有的并发处理能力，不必为十台机器人预先设计十个Agent实例或十条专用线程。真正要压测的是：十台机器人同时说话时，展厅Ollama的分类延迟、移动模型API的并发限制、Java连接/请求容量和答案播报等待时间。若实测排队明显，再给模型调用设置**有上限的并发、等待队列和超时**；只增加Java线程数，不能提高模型本身的推理吞吐。若队列已满，明确提示稍后再问，不能无限堆积旧问题。
+
+**面试速答：** 平台只有一套规划和问答服务，按`taskId、stepId、robotId`隔离十台机器人的状态与上下文；不同机器人请求可并行，同一机器人问答按顺序或打断策略处理。任务推进依靠数据库状态和机器人事件，不靠“一台机器人一条常驻线程”；容量上重点测本地意图模型和远端问答API，再决定是否需要独立的有界线程池或异步队列。
