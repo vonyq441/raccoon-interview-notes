@@ -163,26 +163,31 @@ ReceptionTask
 
 ### 任务、步骤、命令与事件
 
-| 表 | 关键字段 | 作用 |
-|---|---|---|
-| `robot` | robot_id、floor、status、battery、capabilities | 机器人台账 |
-| `exhibit` | exhibit_code、name、floor、waypoint_id | 展台配置 |
-| `explain_script` | script_code、exhibit_code、content | 固定讲解文稿 |
-| `action_script` | action_code、resource_path、fsm_required | 动作脚本 |
-| `reception_task` | task_id、status、plan_version、planned_start_at、actual_started_at | 预约时间与实际开始时间分开保存；任务状态在数据库中维护 |
-| `task_step` | step_id、task_id、sequence、robot_id、type、snapshot | 本次任务步骤快照；预约创建时robot_id可为空，实际分配后写入 |
-| `robot_command` | command_id、step_id、type、status、idempotency_key | 平台下发命令 |
-| `execution_event` | event_id、command_id、event_type、occurred_at | 机器人执行事件 |
-| `qa_message` | conversation_id、role、content、step_id | 完整问答记录 |
-| `knowledge_document` | doc_id、exhibit_code、source_file | 知识文档 |
+先分清三类数据：**平时维护配置、审核后保存计划、执行时产生记录**。以下是Java中央平台的业务模型设计，不代表现有`bot_mind`/`g1_base`源码已经建有这些表。
 
-**为什么保存步骤快照。** 任务创建后，应把当时使用的`waypointId`以及讲解、动作资源的不可变版本写入`task_step.snapshot`。如果脚本允许运行中修改，就要保存实际内容或引用不可变版本，不能只保存一个会指向新内容的`scriptCode`。这样管理员后来修改展台配置时，已经开始的任务仍按审核版本执行。
+| 产生时机 | MySQL表 | 关键字段与作用 |
+|---|---|---|
+| 提前配置 | `robot` | robot_id、name、enabled、floor、capabilities：设备身份与静态能力台账。`enabled`表示是否允许使用，不等于实时在线。 |
+| 提前配置 | `exhibit` | exhibit_code、name、floor、waypoint_id：已有展台与导航点的对应关系。 |
+| 提前配置 | `explain_script`、`action_script` | script_code、exhibit_code、content；action_code、resource_path、fsm_required：可复用的固定讲解稿与动作资源。 |
+| 计划审核通过 | `reception_task` | task_id、status、plan_version、planned_start_at、actual_started_at：整场接待任务，预约时间与实际开始时间分开。 |
+| 计划审核通过 | `task_step` | step_id、task_id、sequence、robot_id、type、snapshot：本次任务的有序步骤；预约时robot_id可为空，实际分配后写入。 |
+| 执行到当前步骤 | `robot_command` | command_id、step_id、type、status、idempotency_key：这次实际下发的命令及当前状态，不在规划时提前生成整条路线的命令。 |
+| 机器人回报执行进度 | `execution_event` | event_id、command_id、event_type、occurred_at：追加记录接收、开始、成功或失败等事件；同一命令可有多条事件。 |
+| 发生问答或上传资料 | `qa_message`、`knowledge_document` | 前者保存问答历史；后者保存doc_id、exhibit_code、source_file等知识文档的管理信息，不是向量本身。 |
+
+**数据库分工。** 上表的业务表放在MySQL。知识文档按展台切分后的文本片段、元信息和768维向量放在PostgreSQL + pgvector，片段用`docId`关联`knowledge_document`；原始PDF可存文件目录或对象存储。Redis只保存带采集时间/过期时间的最新位置、电量、在线状态与短期会话，不把每秒位置当成任务事实持续写入MySQL。Java根据任务占用及最新设备状态判断是否可调度，不能只看台账中的名称或启用标志。
+
+**什么时候查、什么时候写。** 例如审核“先去液冷、再去具身智能”后，Java保存一条`reception_task`和两条`task_step`。轮到液冷步骤时，Java查询该步骤并创建导航命令`C101`，再通知机器人；收到`C101`的`ACCEPTED`、`RUNNING`、`SUCCEEDED`时分别追加`execution_event`并更新命令状态。导航成功后才为同一步骤创建讲解命令`C102`。因此一条步骤可以有多条命令，命令表既用于下发与重连对账，也用于跟踪当前结果；事件表保留过程，不只是另一份命令表。
+
+**为什么保存步骤快照。** 审核通过时，把当时的`waypointId`及讲解、动作资源的不可变版本写入`task_step.snapshot`。若管理员随后把液冷讲解稿从V1改为V2，本次已审核任务仍使用V1；不能只保存一个会指向最新内容的`scriptCode`。中途改线只修订尚未执行的步骤并增加`planVersion`，已完成步骤和事件不被覆盖。
 
 ### Java平台与机器人如何通信
 
 - REST：机器人注册、重连后查询当前任务、知识问答请求和状态对账；
 - WebSocket：命令通知、进度事件、心跳和实时状态；
 - MySQL：保存任务、命令和事件，作为最终事实来源；
+- PostgreSQL + pgvector：保存知识片段及向量，供按展台过滤后的RAG检索；
 - Redis：保存机器人最新状态、短期会话和连接映射。
 
 WebSocket不是任务事实来源。平台先把命令写入数据库，再通过WebSocket通知ZeroClaw；机器人重连后根据任务、步骤和命令记录对账，而不是盲目重放所有待执行命令。
