@@ -10,6 +10,8 @@
 
 配套的 [大厂校招模拟面试题与答案解析](/central-scheduling-interview) 将项目深挖、系统设计、编码思路和行为追问整理为题单，答题时仍以本文的事实边界和本人代码证据为准。
 
+**工程实施以 [V2 实施设计](/central-scheduling-v2-design) 为准。**本篇重在解释业务与面试推导；原先分散的“扩展设计/示意代码”在 V2 文档中被收敛为明确范围、开工门槛、数据约束、接口、事务、失败矩阵与验收定义。V2 是拟实施目标，不代表本项目已验收版本自动拥有这些能力。
+
 ### 先固定设计前提与事实边界
 
 | 项目 | 本文采用的前提或边界 |
@@ -587,7 +589,7 @@ WHERE task_id = :taskId
 
 G1-02 在 A 的等待内容必须属于 A：开放问答走当前展台的 RAG，补充讲稿只能选已发布资源；**不能让模型临时编一段控制动作或未审核讲稿**。若 A 需要让位、访客不愿继续听，或 B 长时间未释放，则去预设安全等待点、提出换序草案或交工作人员。机器人到 A 讲完正文不等于 A 的占用结束；第二组仍在问答时仍占 A。机器人 1 在 B 提前收尾可以作为工作人员授权的选择，但先要确认它下一站或等待点可用；本场景的默认做法不依赖打断第一组。
 
-**关键代码是两次短事务，中间没有长时间数据库锁。**下面是面向 Spring Boot 的服务层示意；Repository、事件认证和端侧适配器名称用于说明调用顺序，**并非已验收 Java 工程中的现成类**：
+**关键操作分为三个短事务，中间没有长时间数据库锁。**下面的服务层代码用于阅读调用顺序；字段、SQL、接口合同、清场权限、竞态处理和验收条件以 [V2 实施设计](/central-scheduling-v2-design) 为准。Repository、事件认证和端侧适配器名称不是已验收 Java 工程中的现成类：
 
 ~~~java
 // 第一次：G1-02 在 A 请求去 B。事务只保护当前状态与排队顺位，不等待模型或机器人。
@@ -650,6 +652,7 @@ public DispatchResult finishAnswerAndDispatch(long claimId, String answerDoneEve
 
     Command command = commands.createVisit(task, claim.targetStepId(), booth.code());
     hold.bindCommand(command.id());         // 此后超时不能自动释放 B，须核对物理状态
+    claim.markClaimed();                     // PROMOTED → CLAIMED，不再占活跃候补位
     task.advanceTo(claim.targetStepId());   // 仅此时推进 Step/任务版本
     outbox.save(command);                   // 提交后发送器投递同一 commandId
     return DispatchResult.queued(command.id());
