@@ -26,7 +26,8 @@ export default defineConfig({
       {
         text: '中央调度平台项目',
         items: [
-          { text: '设计与面试准备', link: '/central-scheduling' }
+          { text: '设计与面试准备', link: '/central-scheduling' },
+          { text: '大厂校招模拟面试题', link: '/central-scheduling-interview' }
         ]
       },
       {
