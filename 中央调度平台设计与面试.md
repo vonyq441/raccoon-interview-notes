@@ -12,7 +12,7 @@
 
 **工程实施以 [V2 实施设计](/central-scheduling-v2-design) 为准。**本篇重在解释业务与面试推导；原先分散的“扩展设计/示意代码”在 V2 文档中被收敛为明确范围、开工门槛、数据约束、接口、事务、失败矩阵与验收定义。V2 是拟实施目标，不代表本项目已验收版本自动拥有这些能力。
 
-**V2 相对本篇早期示例的关键升级。**规划 ChatClient 按任务调用只读工具查询候选机器人（当前楼层、心跳新鲜度、占用、能力）与已发布展台，输出「建议机器人 + 路线」；Java 把可修正的校验错误反馈给模型作一次有限修订，人工审核，点击下发时再核实并原子占用机器人。意图 ChatClient 对“去下一地点”等控制类语音可调用绑定当前机器人的只读状态工具：状态由 bot_mind/Adapter 上报事件和心跳形成 Java 状态快照，过期时通过设备拉取通道 STATE_PROBE，随后 Java 才决定预约、等待或拒绝。以下保留的“只生成展台顺序”和“纯意图分类”代码是较小的解释示例，**不再代表 V2 的完整设计**；V2 的工具调用也不能倒推为原上线版本的已证实能力。
+**V2 相对本篇早期示例的关键升级。**规划 ChatClient 按任务调用只读工具查询候选机器人（当前楼层、心跳新鲜度、占用、能力）与已发布展台，输出「建议机器人 + 路线」；Java 把可修正的校验错误反馈给模型作一次有限修订，人工审核，点击下发时再核实并原子占用机器人。语音则由 Java **严格规则优先**：“下一地点”等完整、明确短句直接形成意图并进入业务校验；复杂、含否定或改线条件的表达才交意图 ChatClient；知识问题才进入当前展台 RAG。Java 从 bot_mind/Adapter 的心跳和执行事件维护状态快照，控制意图统一由 Java 查状态、权限和展台容量，过期时通过设备拉取通道 STATE_PROBE。以下保留的“只生成展台顺序”代码是较小的解释示例，**不再代表 V2 的完整设计**；V2 的工具调用也不能倒推为原上线版本的已证实能力。
 
 ### 先固定设计前提与事实边界
 
@@ -671,13 +671,13 @@ public DispatchResult finishAnswerAndDispatch(long claimId, String answerDoneEve
 
 ## 七、语音问答与多机器人并发
 
-**V2 对“下一地点”的状态来源。**机器人侧 Adapter 上传 ASR 文字、机器人身份与执行事件；Java 接收心跳、导航和真实播报完成事件，在 robot_runtime_state 中维护带版本和时间戳的快照。意图 ChatClient 判断为 NEXT 时可调用绑定当前机器人的 getCurrentRobotState 只读工具。快照过期则返回 STALE，Java 经机器人主动拉取通道请求 STATE_PROBE；状态新鲜也不能直接导航，Java 还须验证说话者权限、当前 Step、播报结束和目标展台名额。意图 ChatClient 本身运行在 Java 服务中，只提出候选；真正的 advance/预约/命令仍由 Java 业务服务负责。下文保留的纯分类代码是简化示例，完整工具调用与回执协议见 V2。
+**V2 对“下一地点”的语音路由与状态来源。**机器人侧 Adapter 上传 ASR 文字、机器人身份与执行事件；Java 接收心跳、导航和真实播报完成事件，在 robot_runtime_state 中维护带版本和时间戳的快照。明确的完整短句“下一地点”由严格规则直接识别，无须调用意图 ChatClient；复杂表达由意图 ChatClient 分类，知识问答才进入 RAG。两个入口的 NEXT 都由 Java 查运行状态和业务事实：快照过期就经机器人主动拉取通道请求 STATE_PROBE；即便状态新鲜，还须验证说话者权限、当前 Step、播报结束和目标展台名额，先预约再导航。若下一展台被占用，登记去重候补并留在当前安全位置，可继续当前展台问答；明确要求跳过则生成待人工审核的改线草案，不自动去下下站。下文代码展示规则优先的简化边界，完整流程与回执协议见 V2。
 
-手机上的“下一站”由已登录且有当前任务操作权限的工作人员调用 Java 任务接口，不需要模型。机器人语音由 bot_mind 采集并经云端 ASR 转成文字：本机对极少量**整句相等**的“停止”短语优先停机并上报；其他文字连同 `robotId、taskId、stepId、planVersion、taskVersion、utteranceId` 送到 Java。Java 的语音路由 ChatClient 调用移动模型 API，把文字分类为 `NEXT、PAUSE、ROUTE_CHANGE、KNOWLEDGE_QA、CHAT、UNKNOWN`。模型只返回意图，不直接下发硬件命令。设备认证只证明哪台机器人发来请求，不能证明说话者是获授权工作人员；普通访客的 NEXT 在建议方案中先提示工作人员确认，只有明确授权的控制会话才允许直接推进。这里保留“需要意图识别”，但不把独立部署的 Ollama 分类服务列为正式架构的必需组件。
+手机上的“下一站”由已登录且有当前任务操作权限的工作人员调用 Java 任务接口，不需要模型。机器人语音由 bot_mind 采集并经云端 ASR 转成文字：本机对极少量**整句相等**的“停止”短语优先停机并上报；其他文字连同 `robotId、taskId、stepId、planVersion、taskVersion、utteranceId` 送到 Java。Java 先对 ASR 文字做小范围完整语句规则匹配；明确的“下一地点”“去下一站”直达业务控制门禁，带目标站名、否定、疑问或附加条件的不匹配。规则未命中才调用意图 ChatClient，将复杂语义分类为 `NEXT、PAUSE、ROUTE_CHANGE、KNOWLEDGE_QA、CHAT、UNKNOWN`。模型只返回意图，不直接下发硬件命令。设备认证只证明哪台机器人发来请求，不能证明说话者是获授权工作人员；普通访客的 NEXT 在建议方案中先提示工作人员确认，只有明确授权的控制会话才允许直接推进。
 
 **模型时间线与切换边界。**按 2026 年 2—6 月的项目时间，开发阶段可在个人电脑通过 Ollama 运行 `qwen3:4b-instruct-2507-q4_K_M` 做中文意图分类原型；它只验证语音路由，不能代替路线规划和 RAG 答案生成。移动网关所列 `DeepSeek-V32` 如果确指 V3.2，也属于 2 月前已发布的模型，可作为早期规划与问答的候选；DeepSeek 官方 API 到 **2026 年 4 月 24 日**才提供 V4-Flash，因此项目叙述中只能将 `DeepSeek-V4-Flash` 放在后期接入阶段，不能写成 2 月启动时使用。**公开发布时间只能证明时间上可能，不能证明移动网关当时已开放、项目实际调用过或具体延迟。**真实运行记录应以网关的 `modelId`、调用日志和配置变更为准。[Qwen3-4B 模型卡](https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507)、[DeepSeek-V3.2 更新记录](https://api-docs.deepseek.com/updates/)、[DeepSeek-V4-Flash 更新记录](https://api-docs.deepseek.com/updates/)。
 
-语音路由、路线规划和问答可以是**共享同一远端 ChatModel 的三个 ChatClient**：分别使用受限意图分类、已有展台排序、依据检索证据回答的提示词。换模型时保持意图枚举和业务接口不变，但要重跑否定句、疑问句、口音 ASR 文本及多轮问题测试；不能只改模型名就认为效果相同。移动网关是否兼容 Spring AI 所用协议、实际 `modelId` 和鉴权方式须以提供的 API 文档核实，不能把公开 DeepSeek 地址直接写成移动网关地址。
+路线规划、复杂语音分类和问答可以是**共享同一远端 ChatModel 的三个 ChatClient**：分别使用工具增强规划、受限意图分类、依据检索证据回答的提示词。前置规则路由是 Java 代码，不是第四个 ChatClient；明确指令不消耗分类模型调用。换模型或调整规则时保持意图枚举和业务接口不变，并重跑否定句、疑问句、口音 ASR 文本及多轮问题测试。移动网关是否兼容 Spring AI 所用协议、实际 `modelId` 和鉴权方式须以提供的 API 文档核实，不能把公开 DeepSeek 地址直接写成移动网关地址。
 
 例如机器人在 S1 液冷展台听到“下一站能不能改成具身智能？”，bot_mind 上传：
 
@@ -685,7 +685,7 @@ public DispatchResult finishAnswerAndDispatch(long claimId, String answerDoneEve
 {"robotId":"G1-01","taskId":"T1001","stepId":"S1","planVersion":1,"taskVersion":8,"utteranceId":"U102","text":"下一站能不能改成具身智能？"}
 ~~~
 
-路由模型应返回 `ROUTE_CHANGE`，而非因为含“下一站”就返回 `NEXT`。Java 校验 S1 仍是当前步骤，再让规划 Agent 基于**未执行步骤**提出改线草案；工作人员审核后才更新 `planVersion`，不会直接导航。若识别为 `KNOWLEDGE_QA`，才进入当前展台的 RAG 检索并调用问答 ChatClient 生成回答；因此一条开放式专业问题可能有“分类、检索、生成回答”三个阶段。分类超时或结果为 `UNKNOWN` 时询问澄清，不猜测执行控制命令。这个请求与返回是接口设计样例，不是已有 bot_mind 源码中的接口。
+规则路由不应命中这句话，意图模型应返回 `ROUTE_CHANGE`，而非因为含“下一站”就返回 `NEXT`。Java 校验 S1 仍是当前步骤，再让规划 Agent 基于**未执行步骤**提出改线草案；工作人员审核后才更新 `planVersion`，不会直接导航。若识别为 `KNOWLEDGE_QA`，才进入当前展台的 RAG 检索并调用问答 ChatClient 生成回答；因此一条开放式专业问题可能有“规则未命中、分类、检索、生成回答”四个阶段。分类超时或结果为 `UNKNOWN` 时询问澄清，不猜测执行控制命令。这个请求与返回是接口设计样例，不是已有 bot_mind 源码中的接口。
 
 Spring Boot 中可把“分类”和“能否执行”分开，避免给模型一个可直接导航的工具。下面只展示核心边界，省略请求校验、异常映射和持久化代码：
 
@@ -705,6 +705,7 @@ class VoiceController {
 @RequiredArgsConstructor
 class VoiceService {
     private final ChatClient intentChatClient;
+    private final VoiceRuleRouter voiceRuleRouter;
     private final TaskService taskService;
     private final RouteService routeService;
     private final QaService qaService;
@@ -713,10 +714,12 @@ class VoiceService {
 
     VoiceReply route(String robotId, VoiceInput input) {
         verifyAuthenticatedDeviceAndBoundContext(robotId, input);
-        IntentResult intent = intentChatClient.prompt()
-            .system("仅从 NEXT、PAUSE、ROUTE_CHANGE、KNOWLEDGE_QA、CHAT、UNKNOWN 中选一类；否定、疑问或歧义不得输出 NEXT")
-            .user(input.text())
-            .call().entity(IntentResult.class);
+        // 仅匹配完整、无否定或附加条件的短句；未命中才调用模型。
+        IntentResult intent = voiceRuleRouter.matchExact(input.text())
+            .orElseGet(() -> intentChatClient.prompt()
+                .system("仅从 NEXT、PAUSE、ROUTE_CHANGE、KNOWLEDGE_QA、CHAT、UNKNOWN 中选一类；否定、疑问或歧义不得输出 NEXT")
+                .user(input.text())
+                .call().entity(IntentResult.class));
 
         return switch (intent.type()) {
             case NEXT -> controlPolicy.advanceOrAskStaffConfirmation(robotId, input);
@@ -730,7 +733,7 @@ class VoiceService {
 }
 ~~~
 
-`entity()`提供类型映射，但输出仍可能解析失败或分类错误；应限制输出长度，检查非空、合法枚举，捕获超时/解析失败并澄清。`advanceOrAskStaffConfirmation` 只在控制会话已授权时调用第五节事务，否则返回待确认操作；授权与版本均由服务端验证。若移动网关不支持所需结构化输出形式，就在接入适配层解析并校验，不能信任模型自由文本或模型自报置信度。
+`VoiceRuleRouter` 要用完整语句白名单并审计匹配原因，不能以包含“下一站”的子串放行。`entity()`提供类型映射，但输出仍可能解析失败或分类错误；应限制输出长度，检查非空、合法枚举，捕获超时/解析失败并澄清。`advanceOrAskStaffConfirmation` 对规则和模型来源执行同一权限/状态检查：目标展台满则 WAITING，回复可继续本地问答或申请跳过；跳过是改线申请，必须按路线约束重新审核。若移动网关不支持所需结构化输出形式，就在接入适配层解析并校验，不能信任模型自由文本或模型自报置信度。
 
 专业问题不改变任务步骤。例如 G1-01 在液冷展台问“它怎么散热”：Java 根据 taskId + stepId 取得 exhibitCode=LIQUID_COOLING，先按展台过滤知识片段，再用 m3e-base 的本地 768 维向量做相似检索；证据足够时把片段与问题送给移动提供的大模型 API，生成短回答和引用，由 bot_mind TTS 播放。没有证据就说明不知道。日常寒暄无需强制 RAG；统一问答服务与规划服务是不同的 ChatClient/提示词，不让问答模型发 NEXT 命令。
 
@@ -763,7 +766,7 @@ List<Document> evidence = vectorStore.similaritySearch(request);
 
 同一机器人则要处理顺序：U1“怎么散热”耗时五秒，晚一秒发出的 U2“尺寸是多少”耗时两秒，U2 可能先返回。`utteranceId` 只是标识，不会自动排队；可以让同一机器人按接收顺序问答、播报，或在访客明确打断时宣布 U1 失效、只播 U2。若 U2 是“它有什么优势”这样的追问，需按顺序维护上下文。答案返回和实际 TTS 播放前都检查当前 `stepId` 及该机器人有效的 `utteranceId`；过期答案不能在下一展台播放。不同机器人并行、同一机器人有序，两者并不冲突。
 
-意图分类也要有失败兜底。明确的手机按钮不走模型；语音里的“停下”之类安全短语先在机器人本地处理，但云端 ASR 不能替代物理急停。其余语音由移动 API 返回受限枚举，遇到“下一站是哪里？”不能因含有“下一站”就执行 NEXT；分类不确定时询问确认，不能默认移动。`NEXT` 即使命中，Java 仍检查任务是否运行、机器人是否正在等待指令、请求的 `stepId` 是否还是当前步骤。这属于业务状态判断，不是再让模型判一次。远端 API 超时不影响手机按钮与本地停止，但开放式语音操作应暂时不可用。
+意图分类也要有失败兜底。明确的手机按钮不走模型；语音里的“停下”之类安全短语先在机器人本地处理，但云端 ASR 不能替代物理急停。Java 对少量完整且明确的 ASR 短句先规则路由；未命中的复杂语音才由移动 API 返回受限枚举，遇到“下一站是哪里？”不能因含有“下一站”就执行 NEXT；分类不确定时询问确认，不能默认移动。`NEXT` 即使命中，Java 仍检查任务是否运行、机器人是否正在等待指令、请求的 `stepId` 是否还是当前步骤。这属于业务状态判断，不是再让模型判一次。远端 API 超时不影响手机按钮、明确规则语音与本地停止，但开放式语音操作应暂时不可用。
 
 旧版意图路由的反例仍值得练习：“去下一个展台”可以是 NEXT；“为什么下一站是液冷”是问题；“先不要去下一个展台”是否定；“先去具身智能，再去液冷”是路线变更。不要靠 `contains("下一站")` 判断。早期本机小模型和后期移动 API 使用同一组标注的现场 ASR 语句回归，重点看 **NEXT 误触发率**、歧义句澄清率和从语音结束到路由结果的 P95 时延；模型给出的置信度不等于真实概率。线上模型变更后必须重新测，而不能用开发电脑上的耗时替代移动网关实测。
 
@@ -852,7 +855,7 @@ List<Document> evidence = vectorStore.similaritySearch(request);
 | “已经下发导航，却发现改线，怎么处理？” | 先判当前命令能否继续；若必须改目标，发取消并等确定结果，状态不明则暂停；审核通过后只变更未完成路线，不能靠改数据库让机器人瞬间转向。 |
 | “反馈丢了，能否重试？” | 先按 commandId 查询机器人实际阶段并对账。同一命令重投需机器人端去重；不确定是否已动作时不能换个新编号盲发。 |
 | “知识问答为何不直接让机器人模型回答？” | 按 taskId/stepId 取得可信展台范围后检索统一知识库，可维护同一套资料和引用；回答只进入 TTS，不得直接推进任务或生成导航目标。 |
-| “用了 DeepSeek-V4-Flash，为什么还要意图识别？” | 需要把开放式语音区分成控制、改线、专业问答和闲聊，但不需要另维护一个生产环境小模型；远端模型只返回受限意图，Java 校验状态并决定动作。手机按钮和本地安全停止不等它。 |
+| “用了 DeepSeek-V4-Flash，为什么还要意图识别？” | 明确完整短句先由 Java 规则路由；开放式语音仍要区分控制、改线、专业问答和闲聊，不必另维护一个生产环境小模型。远端模型只返回受限意图，Java 校验状态并决定动作；手机按钮和本地安全停止不等它。 |
 | “早期本机模型与后期移动 API 如何切换？” | 保持意图枚举、请求字段和 Java 状态机不变，替换 ChatModel 接入配置并回归控制误触发、歧义澄清和 P95 时延。V4-Flash 的发布时间是 2026 年 4 月，移动网关实际上线时间须用配置或日志证明。 |
 
 **自测：能否从头到尾讲出来？**不看上文，按下面七句话复述一遍：①管理员先配置展台、点位、讲稿和动作；②规划 Agent 只选已有展台并排序；③Java 校验并让工作人员审核，保存 Task 和全部 Step；④到场后选择空闲机器人，逐站创建 Command，机器人导航、播稿并回 Event；⑤讲解完等待手机或语音“下一站”，问答不会推进；⑥两台机器人共享展台容量由 Java 事务约束；⑦访客改线或持续受阻触发剩余路线建议，经复核和人工审核后成为新版计划。若其中一句说不清，回到对应章节看例子，而不是死背类名。
