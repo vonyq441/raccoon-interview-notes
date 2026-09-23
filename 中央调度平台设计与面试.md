@@ -13,7 +13,7 @@
 | 项目 | 本文采用的前提或边界 |
 |---|---|
 | 调度对象 | 展厅接待任务、机器人和展台容量；不承诺全局最优路径、厘米级会车或硬实时控制 |
-| 业务流程 | 路线人工审核、访客到场后人工启动、讲完等待下一站；十五分钟是含移动与缓冲的预算，开放问答可能超时 |
+| 业务流程 | 路线人工审核、访客到场后人工启动、讲完等待下一站；“十五分钟左右”是接待目标，不是平台能保证的结束时间，导航与开放问答可能使其超时 |
 | 已确认规模 | 两台机器人；一楼十几个展台、二楼约十个。两台可分别接待或分楼层接力，实际部署分工需按现场情况描述 |
 | 建议部署 | 单 Java 应用按模块组织、每台机器人最多一个活跃业务命令；实际已部署的服务拓扑另行核实 |
 | 已有代码证据 | 本次可读取的 bot_mind/g1_base 中存在导航接入、讲解、动作适配与资源导入；没有据此验证真机表现或代码归属 |
@@ -40,7 +40,7 @@
 | 机器人 | G1-01，可服务一楼，当前空闲 | 台账由平台维护；状态由机器人上报 |
 | 知识资料 | 液冷 FAQ、产品说明 | 管理员审核后入库 |
 
-例如工作人员说：“下午三点接待一组访客，一楼重点介绍液冷和具身智能，十五分钟左右。”Agent 输出的是**从已有展台中选哪些、按什么顺序、预计各花多久**，而不是给 G1 生成一段新的运动代码。固定路线仍可作为模板；只有接待重点、时长或现场条件变化时才需要重新规划。
+例如工作人员说：“下午三点接待一组访客，一楼重点介绍液冷和具身智能，十五分钟左右。”工作人员确认具体日期和“十五分钟左右”是期望目标后，Agent 输出的是**从已有展台中选哪些、按什么顺序**，不负责给每段导航报时或给 G1 生成运动代码。固定路线仍可作为模板；只有接待重点、目标时长或现场条件变化时才需要重新规划。
 
 这里的“讲稿内嵌动作”不能仅凭函数名推断实现。源码虽有将 `${...}` 转为 `<mark .../>` 的 `extract_actions_from_text`，本次在 `src` 中只找到其定义，未找到调用；实际检查到的 `VoiceService` 路径是注册字幕元信息回调，再由 `_on_new_subtitles` 解析 VHML 动作。面试应以实际资源格式和运行链路说明，不能断言占位符转换一定发生。[播放与动作回调](D:/Code/bot_mind/bot_mind/src/service/voice_service.py:315) 展台配置通过 `exhibitCode` 关联机器人认识的 `waypointName`；前者是 Java 业务标识，后者是机器人本机导航和查讲稿使用的名称，两者不是同一个字段。
 
@@ -137,41 +137,38 @@ pgvector 是 PostgreSQL 的扩展，不是另一个独立数据库。知识片�
 
 ~~~text
 工作人员输入需求
-  → Java 查可选展台/模板/预计时长
+  → Java 查可选展台/模板/讲稿配置，记录人工确认的接待时间与目标时长
   → 规划 Agent 产出有序 exhibitCode 草案
-  → Java 校验存在性、楼层、时长和资源版本
+  → Java 校验存在性、楼层、资源版本；独立评估时间目标的可达程度
   → 工作人员查看路线并审核
   → MySQL 保存 T1001 与全部 Step，状态 SCHEDULED
   → 到场前检查就绪；访客到场后才分配机器人并开始
 ~~~
 
-规划结果的最小结构如下。Agent 不需要输出 NAVIGATE/EXPLAIN 活动列表：每个展台的本机执行流程已由机器人侧固定配置。
+规划结果的最小结构如下。开始时间和“十五分钟左右”的目标由请求侧记录并经工作人员确认，不由模型生成；Agent 不需要输出 NAVIGATE/EXPLAIN 活动列表或每站耗时：每个展台的本机执行流程已由机器人侧固定配置。
 
 ~~~json
 {
-  "plannedStartAt": "2026-09-23T15:00:00+08:00",
-  "expectedMinutes": 15,
   "exhibits": [
-    {"exhibitCode": "LIQUID_COOLING", "expectedSeconds": 240},
-    {"exhibitCode": "EMBODIED_AI", "expectedSeconds": 300}
+    {"exhibitCode": "LIQUID_COOLING"},
+    {"exhibitCode": "EMBODIED_AI"}
   ],
   "reason": "先介绍液冷设施，再介绍具身智能演示"
 }
 ~~~
 
-**Agent 为什么能规划，又为什么不能直接下发？**Java 先把启用中的展台列表、楼层、预计讲解时长和可用时段作为受控上下文交给规划 ChatClient。模型根据“重点讲液冷和具身智能”选择编码并排序。模型输出的是候选路线；Java 再逐项检查：编码是否真的存在、是否重复、是否有对应点位与讲稿、总时长是否合理、两台机器人是否存在明显的同站冲突。若模型输出一个不存在的 `EXHIBIT_X`，即使 JSON 完全合法，也要拒绝或请人修改。审核页面把这些判断和冲突原因展示给工作人员，点击通过后才进入 `SCHEDULED`。
+**Agent 为什么能规划，又为什么不能直接下发？**Java 先把启用中的展台列表、楼层、讲稿配置和可用时段作为受控上下文交给规划 ChatClient。模型根据“重点讲液冷和具身智能”选择编码并排序。模型输出的是候选路线；Java 再逐项检查：编码是否真的存在、是否重复、是否有对应点位与讲稿、两台机器人是否存在明显的同站冲突。时间目标由 Java 独立评估并向审核人说明不确定性，不能因为模型声称“十五分钟可完成”就批准。若模型输出一个不存在的 `EXHIBIT_X`，即使 JSON 完全合法，也要拒绝或请人修改。审核页面把这些判断和冲突原因展示给工作人员，点击通过后才进入 `SCHEDULED`。
 
-例如液冷预计 4 分钟、具身智能 5 分钟，剩余 6 分钟不能全部当作“模型自由生成的内容”：需要计入两站间移动、迎宾、提问和缓冲。讲稿若固定为 5 分钟，Agent 不能靠把 `expectedSeconds` 写成 60 就真的压缩讲解；Java 要基于已配置讲稿时长重新核算，超出 15 分钟就请工作人员缩短路线或调整要求。
+例如两段讲稿配置分别为 4 分钟和 5 分钟，仅讲稿就占 9 分钟；剩下的 6 分钟还需覆盖迎宾、机器人导航、开放问答和可能的等待，因此**不能据此断言整条路线能在 15 分钟内完成**。机器人本地 Nav2 执行导航，Java/Agent 不决定实际路径、速度或避障耗时。若连已配置的讲稿时长都超过目标，Java 可明确提示目标冲突；若导航尚无可靠耗时数据，就展示“移动时间未知、整体时长无法保证”，由工作人员删减展台、调整目标或接受超时风险，而不是编造一个精确总时长。
 
 **Spring Boot 分层示例（设计代码）。**Controller 接收请求；PlanningService 调用 Spring AI；TaskService 在事务中校验并保存；Mapper 负责 SQL。代码只展示关键边界，不代表原项目仓库已有这些类。
 
 ~~~java
-// DTO：模型只输出已配置的展台编码与顺序
-record VisitChoice(String exhibitCode, Integer expectedSeconds) {}
-record PlanDraft(OffsetDateTime plannedStartAt,
-                 Integer expectedMinutes,
-                 List<VisitChoice> exhibits,
-                 String reason) {}
+// DTO：开始时间和目标时长由人确认；模型只输出已配置的展台编码与顺序
+record RequirementRequest(String text, OffsetDateTime plannedStartAt,
+                          Integer targetMinutes) {}
+record VisitChoice(String exhibitCode) {}
+record PlanDraft(List<VisitChoice> exhibits, String reason) {}
 
 @RestController
 @RequestMapping("/api/reception-tasks")
@@ -181,7 +178,7 @@ class ReceptionController {
 
     @PostMapping("/drafts")
     PlanView create(@RequestBody RequirementRequest request) {
-        return planning.createDraft(request.text());
+        return planning.createDraft(request);
     }
 
     @PostMapping("/{taskId}/approve")
@@ -197,13 +194,14 @@ class PlanningService {
     private final ExhibitMapper exhibitMapper;
     private final TaskService tasks;
 
-    PlanView createDraft(String requirement) {
+    PlanView createDraft(RequirementRequest request) {
         List<ExhibitOption> allowed = exhibitMapper.listEnabled();
         PlanDraft draft = planningChatClient.prompt()
-            .system("只从给定展台中选择并排序；不得编造展台、导航点、讲稿或动作。")
-            .user("需求：" + requirement + "；可选展台：" + allowed)
+            .system("只从给定展台中选择并排序；不得编造展台、导航点、讲稿、动作或耗时。")
+            .user("需求：" + request.text() + "；目标分钟数：" + request.targetMinutes()
+                + "（仅作选站偏好，不得承诺完成时间）；可选展台：" + allowed)
             .call().entity(PlanDraft.class);
-        return tasks.saveDraft(requirement, draft); // 模型调用不占用数据库事务
+        return tasks.saveDraft(request, draft); // 模型调用不占用数据库事务
     }
 }
 
@@ -214,11 +212,11 @@ class TaskService {
     private final TaskStepMapper steps;
 
     @Transactional
-    PlanView saveDraft(String requirement, PlanDraft draft) {
-        requireValidTimeAndNonEmptyUniqueCodes(draft);
+    PlanView saveDraft(RequirementRequest request, PlanDraft draft) {
+        requireConfirmedStartPositiveTargetAndUniqueCodes(request, draft);
         String taskId = newTaskId();
-        tasks.insert(taskId, requirement, draft.plannedStartAt(),
-                     "PENDING_REVIEW", 1);
+        tasks.insert(taskId, request.text(), request.plannedStartAt(),
+                     request.targetMinutes(), "PENDING_REVIEW", 1);
         int order = 1;
         for (VisitChoice choice : draft.exhibits()) {
             ExhibitConfig config = exhibits.findEnabled(choice.exhibitCode());
@@ -233,7 +231,7 @@ class TaskService {
     @Transactional
     void approve(String taskId, int expectedVersion) {
         requireReviewerConfirmed(taskId); // 从已认证会话取得审核人，并校验展厅权限
-        revalidateDraftResourcesAndBudget(taskId, expectedVersion);
+        revalidateDraftResourcesAndExplainTimeRisk(taskId, expectedVersion);
         if (tasks.markScheduled(taskId, expectedVersion) != 1)
             throw new ConflictException("计划已经变化，请重新查看");
     }
@@ -247,7 +245,7 @@ interface ExhibitMapper {
 @Mapper
 interface ReceptionTaskMapper {
     void insert(String id, String requirement, OffsetDateTime when,
-                String status, int version);
+                Integer targetMinutes, String status, int version);
     int markScheduled(String id, int expectedVersion);
     PlanView loadPlan(String id);
 }
@@ -272,11 +270,13 @@ WHERE task_id = :taskId
 
 ### 4.1 为什么需要模型，路线怎样才算可行
 
-模型负责把“重点看算力、控制在十五分钟”映射到已有展台和偏好；固定路线直接选模板。若需求已经是明确展台集合和顺序，就不再调用规划模型。没有做多轮自主工具执行时，可称“受约束的规划 Agent/LLM 工作流”，不夸大为自主多 Agent 系统。
+模型负责把“重点看算力、希望十五分钟左右”映射到已有展台和偏好；“十五分钟”是请求侧的目标，不是模型计算出的完工承诺。固定路线直接选模板。若需求已经是明确展台集合和顺序，就不再调用规划模型。没有做多轮自主工具执行时，可称“受约束的规划 Agent/LLM 工作流”，不夸大为自主多 Agent 系统。
 
-Java 的校验分两层：**硬约束**包括展厅/楼层、设备能力、开放时间、资源包版本、必经展台、可达性与交接条件；**软偏好**包括重点覆盖、少走路、少等待。硬约束不满足就返回具体原因；模型写一段理由或人工点击通过都不能让不可行方案变可行。人工要改变需求或配置后重新审核。
+Java 的校验分两层：**硬约束**包括展厅/楼层、设备能力、开放时间、资源包版本、必经展台、已配置点位的可达关系与交接条件；**软偏好**包括重点覆盖、少走路、少等待和目标接待时长。硬约束不满足就返回具体原因；模型写一段理由或人工点击通过都不能让不可行方案变可行。人工要改变需求或配置后重新审核。若业务要求的是绝对截止时间，未知的导航和问答耗时使平台无法保证准点结束，必须把该限制交给工作人员确认或调整，不把软目标伪装为已验证的硬约束。
 
-预算按 `迎宾 + Σ已配置讲稿时长 + Σ可达路径预计移动时间 + 问答缓冲 + 楼层交接缓冲` 计算，不采信模型自报耗时。移动估计来自导航团队提供的点位连通关系/距离或现场测量；缺少依据的路段标记待核实，不能用直线距离假装通道可达。到场迟到、提问超时会消耗剩余预算，平台提示超时或申请删减剩余展台，不能悄悄加速动作。
+**时间怎样判断？**平台先读取讲稿配置的播放时长或实测讲解时长，得到可解释的讲解基线；它也只是估计，TTS、动作、打断都会改变实际值。点位间移动时间只有在导航侧提供历史出发/到达事件、现场人工计时或双方确认的估计值时才纳入区间估算，并标明来源、样本量和适用条件。仅知道点位连通，不等于知道走多久；没有依据的路段标记为“未知”，不能拿地图直线距离或模型猜测填空。迎宾、自由提问、排队和楼层交接同样可能变化，计划界面应分别显示已知基线、可用估计、未知项和超时风险，不能只给一个“预计 14 分 32 秒”的数字。
+
+执行时，Java 只根据机器人回报的出发、到站、讲解完成等事件计算**已耗时**，结合当前剩余站点重新评估目标；导航超时由机器人侧上报，本地导航栈处理路径和避障。若已超目标或剩余时间明显不足，平台提示工作人员删减可选站、延长接待或结束，不擅自提高机器人速度、缩短固定讲稿或自动跳过必经站。这个时间评估是调度辅助信息，不能替代机器人导航侧的 ETA 和安全控制。
 
 二十多个展台的起步方案可用人工模板、确定性校验和小范围候选排序，不需要先上强化学习、全局多机器人路径算法。对同一批需求比较“人工模板”与“模型草案”：看有效路线比例、必须展台覆盖、工作人员修改幅度和从提出需求到最终审核的总耗时。只有模型调用快，不等于接待准备更快。
 
@@ -464,7 +464,7 @@ Java 固化事件和当前事实：已完成站、当前命令、剩余时长、
 明确拖动顺序 → 直接业务校验
 模糊自然语言或需权衡的受阻 → Agent 提出候选剩余路线
     ↓
-Java 校验展台存在、楼层/能力、时间预算和共享资源容量
+Java 校验展台存在、楼层/能力和共享资源容量，并说明时间目标风险
     ↓
 工作人员审核；通过后 planVersion 加一，仅替换未执行步骤
     ↓
@@ -680,7 +680,7 @@ List<Document> evidence = vectorStore.similaritySearch(request);
 
 > 项目面向甘肃 5G 联合创新中心的展厅接待，实际部署两台机器人，一楼十几个展台，二楼约十个。我主要负责 Java 平台中的中央规划 Agent 和 RAG 知识问答 Agent，这两部分已经包含在上线验收范围内。机器人接入展厅 Wi-Fi；开发联调时我们也接入该 Wi-Fi，通过 SSH 登录机器人排查问题。
 >
-> 规划部分把接待重点和时间要求转换成已有展台的路线草案，Java 再校验展台、资源和时长，由工作人员确认。执行层负责把确定的目标交给机器人导航与讲解，导航和运动算法由机器人团队负责。我的关注点是让模型输出能够接入业务流程，而不是直接控制运动。
+> 规划部分把接待重点和目标时长转换成已有展台的路线草案，Java 再校验展台与资源，用讲稿配置及有来源的移动数据提示时间风险，由工作人员确认。执行层负责把确定的目标交给机器人导航与讲解，导航和运动算法由机器人团队负责。我不会声称中央 Agent 可以准确预测导航耗时或保证十五分钟结束。
 >
 > 问答部分围绕当前展台检索知识资料，组织回答并提供依据，同时处理无答案、上下文切换和模型异常。准备项目复盘时，我会分别说明实际完成的实现、验收结果，以及进一步补强并发和断线恢复的方案。具体效果用真实测试记录说明，不能用设计目标替代实测。
 
@@ -702,7 +702,7 @@ List<Document> evidence = vectorStore.similaritySearch(request);
 
 | 面试官追问 | 应说清的实现思路 |
 |---|---|
-| “Agent 生成的路线怎么保证可执行？” | 提供受控展台清单；用结构化输出拿编码和顺序；Java 查展台、点位、讲稿、时长与容量；冲突展示给人审核。结构化 JSON 不是正确性保证。 |
+| “Agent 生成的路线怎么保证可执行？” | 提供受控展台清单；用结构化输出拿编码和顺序；Java 查展台、点位、讲稿与容量；讲稿时长和有来源的移动估计只用于提示目标风险，导航未知时不保证结束时间；冲突展示给人审核。结构化 JSON 不是正确性保证。 |
 | “为什么机器人不直接拿完整计划？” | 当前机器人只需安全执行当前站；完整路线和跨机器人资源事实由 Java 保持。改线只更新未执行步骤，下一个目标仍由 Java 决定。 |
 | “两台机器人同时抢容量为 1 的展台怎么办？” | 计划时预判，出发前在事务中锁资源并复核占用；先抢到的预约，另一台等待或调整，确认访客离开展台后释放。不要只依赖模型建议或缓存读数。 |
 | “已经下发导航，却发现改线，怎么处理？” | 先判当前命令能否继续；若必须改目标，发取消并等确定结果，状态不明则暂停；审核通过后只变更未完成路线，不能靠改数据库让机器人瞬间转向。 |
@@ -739,7 +739,7 @@ optimum-cli export onnx --model ./m3e-base-source --library-name transformers --
 |---|---|
 | 就两台机器人，为什么要 Agent？没有它会怎样？ | 模板也能接待；模型减少自然语言需求到可审路线的整理工作。用相同需求比较审核总耗时和人工修改，而非宣称机器人数量决定必须用 AI。 |
 | 你本人做了什么？哪个 PR/类/接口能证明？ | 规划 Agent 与 RAG 是确认职责；列出本人具体的提示词、校验、检索、异常处理与测试工作。通信协议未核实前不背 WebSocket 选型理由。 |
-| JSON 解析成功为什么还不能执行？ | 语义、权限、资源、时长和状态仍可能错误；演示一个编造展台、超预算或旧任务上下文被拒绝的真实用例。 |
+| JSON 解析成功为什么还不能执行？ | 语义、权限、资源和状态仍可能错误；演示编造展台或旧任务上下文被拒绝的用例。若时间目标有风险，应明示估计依据与未知项，不能把导航耗时猜错当成模型格式错误。 |
 | 模型规划不合理怎么定位？ | 分开记录需求解析、受控候选、模型草案、校验原因和人工修改；判断是信息缺失、提示词、资料配置还是确定性校验缺陷。 |
 | 问答错了是检索错还是生成错？ | 先看正确证据是否进 TopK，再看答案是否受证据支持；分别改切块/召回和生成约束，不能只反复调 prompt。 |
 | 你说没有答案就拒答，谁判断？ | 阈值、资料范围与证据充分性共同作用；阈值通过验证集调节，再用独立样本检验“错误回答”和“过度拒答”的取舍，不能把相似度当概率。 |
