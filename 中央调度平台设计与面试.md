@@ -410,14 +410,14 @@ BEGIN
   核对 status=RUNNING、current_step_id、plan_version、task_version、机器人归属
   核对当前 Step=WAITING_COMMAND，当前 Command 确定结束
   读取本版本下一 Step；锁机器人占用行和目标展台资源行
-  获取目标名额失败 → 不改变步骤，不创建命令，返回 RESOURCE_BUSY
+  获取目标名额失败 → 不改变步骤，不创建命令；若启用 6.3 节候补策略，则登记 WAITING 候补并返回等待原因
   成功 → S1=COMPLETED；S2=IN_PROGRESS；更新 current_step_id、task_version
   写目标预约、唯一 robot_command、command_outbox、操作结果
 COMMIT
 发送器在提交后投递同一 commandId
 ~~~
 
-同一任务的锁顺序统一为任务行→机器人行→按编号排序的展台行，所有写入口遵守。不可在持锁期间调用模型或等待机器人。数据库死锁可有限重试**整笔数据库事务**，不是重新执行物理动作。成功操作结果与状态同事务保存，客户端丢响应后重试才能得到原 `commandId`；`RESOURCE_BUSY` 不自动承诺将来出发，工作人员重新确认后提交新请求。最后一站没有下一 Step 时提供明确的“结束接待”，逻辑结束与机器人/访客离场分别确认。
+同一任务的锁顺序统一为任务行→机器人行→按编号排序的展台行，所有写入口遵守。不可在持锁期间调用模型或等待机器人。数据库死锁可有限重试**整笔数据库事务**，不是重新执行物理动作。成功操作结果与状态同事务保存，客户端丢响应后重试才能得到原 `commandId`；普通 `RESOURCE_BUSY` 不自动承诺将来出发。只有显式进入 6.3 节的候补策略，才登记可取消的排队记录；轮到该任务后也要再次校验，不能凭旧请求直接开动。最后一站没有下一 Step 时提供明确的“结束接待”，逻辑结束与机器人/访客离场分别确认。
 
 机器人回报可以用统一事件格式（仍是设计报文）：
 
@@ -463,7 +463,7 @@ HTTP、WebSocket 或其他传输都不能替代下面的业务约束。实际项
 
 端侧可用小型本地数据库实现 inbox/outbox，不要求为了两台机器人引入消息中间件。表名不重要，**先落盘再确认、重复不重复执行**才是关键。物理动作和数据库提交无法组成原子事务：若重启时只知动作已开始而不知是否完成，就返回 UNKNOWN，核对下层执行状态或转人工，不能声称严格 exactly-once。
 
-最小约束包括：操作记录 `UNIQUE(taskId, requestId)`、命令主键 `commandId` 与 `UNIQUE(robotId, assignmentEpoch, commandSeq)`、事件 `UNIQUE(robotId, eventId)`、预约 `UNIQUE(commandId, exhibitCode)`。机器人占用行保存 `ownerTaskId、activeCommandId、assignmentEpoch`，受锁保护，不能只存一个 BUSY 字符串。业务明确重试可创建新的执行尝试，但必须先确认旧命令终结；传输重投始终使用原 commandId。发送队列按状态/下次重试时间、预约按展台/状态、事件按命令/序号建查询索引，保存期限覆盖重连补报与审计窗口。
+最小约束包括：操作记录 `UNIQUE(taskId, requestId)`、命令主键 `commandId` 与 `UNIQUE(robotId, assignmentEpoch, commandSeq)`、事件 `UNIQUE(robotId, eventId)`。普通下发时预约可用 `UNIQUE(commandId, exhibitCode)` 去重；若采用 6.3 节“候补转短时预约”，预约在创建时尚无 Command，应另有 `reservationId` 主键和唯一 `waitClaimId`，`commandId` 在正式下发时再绑定，不能靠可空的 commandId 识别这段预约。机器人占用行保存 `ownerTaskId、activeCommandId、assignmentEpoch`，受锁保护，不能只存一个 BUSY 字符串。业务明确重试可创建新的执行尝试，但必须先确认旧命令终结；传输重投始终使用原 commandId。发送队列按状态/下次重试时间、预约按展台/状态、事件按命令/序号建查询索引，保存期限覆盖重连补报与审计窗口。
 
 事件包含 `eventSeq` 辅助发现重复/缺口，排序不依赖不同机器的墙上时钟。终态先到、进度后到时，可用经过校验的完整终态收敛，再补齐审计；不得因缺少一条中间事件永远卡死。旧事件保留历史，不允许把终态回退。终态属于哪个 Command，要与该命令创建时的计划版本对应；只修改未来路线后，仍应接纳当前旧版本命令的合法完成事件。
 
@@ -525,7 +525,7 @@ Java 校验展台存在、楼层/能力和共享资源容量，并说明时间�
 
 事件 B 的差别在于：若 G1-01 **正在导航**去具身智能，不能仅把数据库里的下一站改成 AI 应用就认为机器人改道成功。先把本地导航取消请求发给机器人，并等待取消确认或实际到达结果；状态仍不明时暂停新目标下发。导航系统只回报受阻并不代表通道一定被人挡住，工作人员可以通过现场观察确认原因。若两站都必须经过同一堵塞通道，Agent 调换顺序并不能解决问题，人工暂停才是正确结果。
 
-**共享资源约束怎么落地？**每个展台配置允许同时接待的组数，例如 AI 应用 `capacity=1`。只有出发前才取得目标名额；讲完、点击下一站或取消任务都不能直接释放当前展台，必须确认访客已经离开。预约区分 `RESERVED`（已保留、可能在途）、`OCCUPIED`（已到站）、`UNKNOWN`（是否仍使用不明）、`RELEASED`；前三种都占容量。TTL 到期只触发核对，不能让失联机器人或仍在场的访客被当成消失。
+**共享资源约束怎么落地？**每个展台配置允许同时接待的组数，例如 AI 应用 `capacity=1`。目标名额只在准备本次出发时取得；6.3 节的候补在前一组实际清场后，可短暂预约给下一顺位以便当前回答收尾，绝不提前锁住整条路线。讲完、点击下一站或取消任务都不能直接释放当前展台，必须确认接待组和机器人已离开讲解区域。预约区分 `RESERVED`（已保留、可能在途）、`OCCUPIED`（已到站）、`UNKNOWN`（是否仍使用不明）、`RELEASED`；前三种都占容量。已下发命令或物理状态不明时，TTL 到期只触发核对，不能让失联机器人或仍在场的访客被当成消失。
 
 建议在 `exhibit` 保存 `capacity、occupied_slots`，与预约明细同事务维护：
 
@@ -571,6 +571,96 @@ WHERE task_id = :taskId
 -- 新版未来步骤和 route_revision 同事务保存，旧版标记 SUPERSEDED 并保留；
 -- 更新行数不是 1 则说明页面版本过期，整笔事务回滚。
 ~~~
+
+### 6.3 两场接待错峰开始，却在同一展台追尾：候补、短时预约与等待体验（扩展设计）
+
+假设 14:00 和 14:20 各开始一场接待，分别由 G1-01、G1-02 带队。G1-01 在 B 展台开放问答很久；G1-02 已到 A，下一站也是容量为 1 的 B。二十分钟错峰只能用于排程预警，不能保证开放问答的结束时间。G1-02 对 B 的预约失败时，**不能先导航过去排队**，也不能把 G1-01 的讲解强制标为完成。
+
+这里不借用真正的“读锁/写锁”：标准读写锁中，B 的写占用与另一台的读锁互斥，而且不能让数据库事务锁跨越整场讲解。设计为两种持久业务记录：`OCCUPIED/RESERVED/UNKNOWN` 的**展台占用预约**计入容量；`WAITING` 的**候补请求**只表示排队顺位，不占容量、不授权导航。容量为 1 时可以是 `B=OCCUPIED(G1-01)` 且 `候补首位=G1-02`；其他任务可以排在后面，但不能越过首位直接取得 B。若 B 容量大于 1，则按空余名额逐个兑现候补，不把展台写死为互斥资源。
+
+| 时刻 | B 的容量记录 | G1-02 在 A 的行为 | Java 平台动作 |
+|---|---|---|---|
+| B 仍在讲解 | G1-01 `OCCUPIED` | 当前讲解结束后可开放 A 的问答或播放已审核补充讲稿 | G1-02 登记 `WAITING`；保持当前 A 步骤，不创建去 B 的命令 |
+| G1-01 与访客确认离开 B | 释放 G1-01；将首位候补原子转为 G1-02 `RESERVED` | 完成当前回答、不再接新问题，播报准备去 B | 发出带预约版本的“准备收尾”业务通知；短时预约计入 B 容量 |
+| G1-02 准备出发 | G1-02 `RESERVED` 且仍在有效窗口 | 确认当前播报已结束、路线和控制权仍有效 | 绑定 Command/outbox；提交后才下发去 B，实际清场后释放 A |
+| G1-02 到达 B | G1-02 `OCCUPIED` | 开始 B 的讲解 | 消费到站事件并更新预约阶段 |
+
+G1-02 在 A 的等待内容必须属于 A：开放问答走当前展台的 RAG，补充讲稿只能选已发布资源；**不能让模型临时编一段控制动作或未审核讲稿**。若 A 需要让位、访客不愿继续听，或 B 长时间未释放，则去预设安全等待点、提出换序草案或交工作人员。机器人到 A 讲完正文不等于 A 的占用结束；第二组仍在问答时仍占 A。机器人 1 在 B 提前收尾可以作为工作人员授权的选择，但先要确认它下一站或等待点可用；本场景的默认做法不依赖打断第一组。
+
+**关键代码是两次短事务，中间没有长时间数据库锁。**下面是面向 Spring Boot 的服务层示意；Repository、事件认证和端侧适配器名称用于说明调用顺序，**并非已验收 Java 工程中的现成类**：
+
+~~~java
+// 第一次：G1-02 在 A 请求去 B。事务只保护当前状态与排队顺位，不等待模型或机器人。
+@Transactional
+public AdvanceResult requestNext(AdvanceRequest req) {
+    ReceptionTask task = tasks.lockById(req.taskId()); // 同一任务的 NEXT/改线/取消共用入口
+    requireExpectedVersion(task, req);
+    requireCurrentStepReady(task, req.fromStepId());
+    if (operations.exists(req.taskId(), req.requestId())) {
+        return operations.replayOrRejectDifferentPayload(req); // 网络重试不插入第二条候补
+    }
+
+    String target = steps.nextExhibit(task); // 只从已审核的剩余路线取 B
+    robots.lockAssignment(task.robotId());
+    exhibits.lockByCode(target);             // 本次尝试和其他占用写入串行化
+    if (exhibits.tryTakeSlot(target) == 1) {
+        // 普通路径：预约、Command、outbox、操作结果同事务；提交后才发送。
+        return dispatchCurrentStep(task, target, req.requestId());
+    }
+
+    WaitClaim claim = claims.insertOrReuseWaiting(task, target, req.requestId());
+    operations.saveWaiting(req, claim.id());
+    // 不推进 A 的 Step，也不创建“去 B”的命令；前端显示 B 正被占用。
+    return AdvanceResult.waiting(claim.id(), target);
+}
+
+// 第二次：消费经验证的 B 清场事件。先释放原占用，再把候补首位转为短时预约。
+@Transactional
+public void onBoothCleared(ClearedEvent event) {
+    ReceptionTask owner = tasks.lockById(event.taskId());
+    Exhibit booth = exhibits.lockByCode(event.exhibitCode());
+    Reservation old = reservations.lockById(event.reservationId());
+    requireAuthenticCurrentEvent(owner, old, event); // 重复、旧命令、仅“讲完”均不能清场
+    if (old.isReleased()) return;                    // 清场事件重投只释放一次
+
+    old.markReleased();
+    booth.releaseOneSlot();
+    WaitClaim first = claims.lockFirstWaiting(booth.code()); // 同优先级 FIFO
+    if (first == null || !booth.isOpen()) return;
+
+    booth.takeOneSlot(); // 同事务扣回刚释放的容量；第三台不能插队
+    Reservation hold = reservations.createForClaim(first.id(), booth.code(),
+            handoffDeadline()); // 尚未下发 Command，短时窗口用于 A 的当前回答收尾
+    first.markPromoted(hold.id());
+    notifications.saveOutbox(first.taskId(), "BOOTH_RESERVED", hold.id());
+}
+
+// G1-02 收到“当前回答已结束”后再进入此短事务，不能拿着旧排队结果直接出发。
+@Transactional
+public DispatchResult finishAnswerAndDispatch(long claimId, String answerDoneEventId) {
+    WaitClaim snapshot = claims.find(claimId);
+    ReceptionTask task = tasks.lockById(snapshot.taskId());
+    robots.lockAssignment(task.robotId());
+    Exhibit booth = exhibits.lockByCode(snapshot.exhibitCode());
+    WaitClaim claim = claims.lockById(claimId);
+    Reservation hold = reservations.lockById(claim.reservationId());
+    requirePromotedAndUnexpired(claim, hold);
+    requireAnswerDoneForHold(task, hold, answerDoneEventId); // 关联本次收尾，拒绝旧播报事件
+    requireRouteAndRobotStillValid(task, claim, booth); // 取消、改线、离线时拒绝
+
+    Command command = commands.createVisit(task, claim.targetStepId(), booth.code());
+    hold.bindCommand(command.id());         // 此后超时不能自动释放 B，须核对物理状态
+    task.advanceTo(claim.targetStepId());   // 仅此时推进 Step/任务版本
+    outbox.save(command);                   // 提交后发送器投递同一 commandId
+    return DispatchResult.queued(command.id());
+}
+~~~
+
+`exhibit_wait_claim` 至少保存 `claimId、exhibitCode、taskId、targetStepId、queueNo、status、reservationId、创建时间`，按 `(exhibitCode,status,queueNo)` 查首位；同一任务的活跃 `claimId` 由任务行或唯一约束限制，重复 NEXT 不能插出多个顺位。取消/改线也要在任务事务中撤销候补或释放**尚未下发**的短时预约；所有释放容量的路径都要尝试兑现下一顺位，不能只在机器人正常离场时处理。清场事务只锁原任务、B 展台及候补行，不在持有 B 锁时反向锁候补任务，避免和 NEXT 的“任务→展台”顺序形成锁环。候补任务在真正下发前再次校验任务版本；若已取消，释放短时预约并通知下一顺位。B 关闭时不兑现候补，而是通知等待中的工作人员改线或暂停。
+
+短时预约的期限是**可配置的收尾窗口**，不是对导航耗时的预测。只在 `RESERVED` 且尚无 Command/outbox、确认机器人未出发时，超时处理器才能撤销预约并兑现下一顺位；已有命令或执行状态不明则标 `UNKNOWN` 并对账，绝不能靠 TTL 把 B 重新分配。G1-02 从 A 出发后，只有确认接待组和机器人离开 A，才释放 A；短暂同时占用 A 与 B 的容量是为了避免两个展台都误判为空闲。
+
+最后，播报用语也要与实际位置一致：G1-02 准备离开 A 时可以说“当前问题回答完，我们前往 B”；**不能说留在 A 继续向 G1-02 提问**，因为它正在离开。若确实允许游客留在 A 自行参观，需要另行定义工作人员接管和 A 的容量释放条件。以上队列、收尾通知及代码均为扩展设计，面试中不能说成现有机器人侧已实现的回执或上线验收指标。
 
 ## 七、语音问答与多机器人并发
 
