@@ -11,7 +11,8 @@ export default defineConfig({
     ['meta', { name: 'theme-color', content: '#0f766e' }],
     ['meta', { name: 'apple-mobile-web-app-capable', content: 'yes' }],
     ['meta', { name: 'apple-mobile-web-app-status-bar-style', content: 'default' }],
-    ['meta', { name: 'format-detection', content: 'telephone=no' }]
+    ['meta', { name: 'format-detection', content: 'telephone=no' }],
+    ['script', {}, `(function(){try{if(localStorage.getItem('raccoon-docs-eye-care')==='1'){document.documentElement.classList.add('eye-care')}}catch(e){}})();`]
   ],
   themeConfig: {
     logo: '/logo.svg',
