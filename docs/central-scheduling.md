@@ -137,7 +137,7 @@ Task：整场接待，例如今天 15:00 的领导参观
 | reception_task、task_step | MySQL；草案保存、审核后成为正式计划 | 接待时间、当前计划版本、有序展台及资源快照 |
 | robot_command、execution_event | MySQL；实际下发与回报时产生 | 去重、执行状态、断线对账与审计 |
 | route_revision、incident | MySQL；现场事件与改线时产生 | 记录触发原因、旧新版本和审核结果 |
-| exhibit_reservation | MySQL；安排下一站前占用 | 避免两个接待组同时抢占容量有限的展台 |
+| exhibit_allocation（V2） | 业务库；下一站申请时产生，WAITING 不占容量、RESERVED/OCCUPIED/UNKNOWN 占容量 | 一张表表达候补到占用，避免两个接待组同时抢同一讲解容量 |
 | 机器人最新位置、电量、心跳 | Redis；机器人持续上报并设置过期时间 | 实时展示与调度，不把每个坐标点写入任务表 |
 | knowledge_document | MySQL；资料上传时登记 | 原文件、所属展台、导入状态 |
 | 知识片段、元数据、embedding | PostgreSQL + pgvector；离线入库 | RAG 按展台过滤和语义检索 |
@@ -469,7 +469,7 @@ HTTP、WebSocket 或其他传输都不能替代下面的业务约束。实际项
 
 端侧可用小型本地数据库实现 inbox/outbox，不要求为了两台机器人引入消息中间件。表名不重要，**先落盘再确认、重复不重复执行**才是关键。物理动作和数据库提交无法组成原子事务：若重启时只知动作已开始而不知是否完成，就返回 UNKNOWN，核对下层执行状态或转人工，不能声称严格 exactly-once。
 
-最小约束包括：操作记录 `UNIQUE(taskId, requestId)`、命令主键 `commandId` 与 `UNIQUE(robotId, assignmentEpoch, commandSeq)`、事件 `UNIQUE(robotId, eventId)`。普通下发时预约可用 `UNIQUE(commandId, exhibitCode)` 去重；若采用 6.3 节“候补转短时预约”，预约在创建时尚无 Command，应另有 `reservationId` 主键和唯一 `waitClaimId`，`commandId` 在正式下发时再绑定，不能靠可空的 commandId 识别这段预约。机器人占用行保存 `ownerTaskId、activeCommandId、assignmentEpoch`，受锁保护，不能只存一个 BUSY 字符串。业务明确重试可创建新的执行尝试，但必须先确认旧命令终结；传输重投始终使用原 commandId。发送队列按状态/下次重试时间、预约按展台/状态、事件按命令/序号建查询索引，保存期限覆盖重连补报与审计窗口。
+最小约束包括：操作记录 `UNIQUE(taskId, requestId)`、命令主键 `commandId` 与 `UNIQUE(robotId, assignmentEpoch, commandSeq)`、事件 `UNIQUE(robotId, eventId)`。V2 的 `exhibit_allocation` 用 `allocationId` 作主键，并对 `(taskId, planVersion, stepNo)` 建活跃状态部分唯一索引；它在 WAITING 时还没有 Command，转 RESERVED 后也可能尚未下发，因此不能靠可空的 commandId 给展台申请去重。机器人占用行保存 `ownerTaskId、activeCommandId、assignmentEpoch`，受锁保护，不能只存一个 BUSY 字符串。业务明确重试可创建新的执行尝试，但必须先确认旧命令终结；传输重投始终使用原 commandId。发送队列按状态/下次重试时间、展台申请按展台/状态/顺位、事件按命令/序号建查询索引，保存期限覆盖重连补报与审计窗口。
 
 事件包含 `eventSeq` 辅助发现重复/缺口，排序不依赖不同机器的墙上时钟。终态先到、进度后到时，可用经过校验的完整终态收敛，再补齐审计；不得因缺少一条中间事件永远卡死。旧事件保留历史，不允许把终态回退。终态属于哪个 Command，要与该命令创建时的计划版本对应；只修改未来路线后，仍应接纳当前旧版本命令的合法完成事件。
 
@@ -582,7 +582,7 @@ WHERE task_id = :taskId
 
 假设 14:00 和 14:20 各开始一场接待，分别由 G1-01、G1-02 带队。G1-01 在 B 展台开放问答很久；G1-02 已到 A，下一站也是容量为 1 的 B。二十分钟错峰只能用于排程预警，不能保证开放问答的结束时间。G1-02 对 B 的预约失败时，**不能先导航过去排队**，也不能把 G1-01 的讲解强制标为完成。
 
-这里不借用真正的“读锁/写锁”：标准读写锁中，B 的写占用与另一台的读锁互斥，而且不能让数据库事务锁跨越整场讲解。设计为两种持久业务记录：`OCCUPIED/RESERVED/UNKNOWN` 的**展台占用预约**计入容量；`WAITING` 的**候补请求**只表示排队顺位，不占容量、不授权导航。容量为 1 时可以是 `B=OCCUPIED(G1-01)` 且 `候补首位=G1-02`；其他任务可以排在后面，但不能越过首位直接取得 B。若 B 容量大于 1，则按空余名额逐个兑现候补，不把展台写死为互斥资源。
+这里不借用真正的“读锁/写锁”：数据库事务锁不能跨越整场讲解。V2 用一张 `exhibit_allocation` 表，一条记录贯穿一次目标展台申请：`WAITING` 只表示排队、不占容量、不授权导航；同一行转成 `RESERVED/OCCUPIED/UNKNOWN` 后才计入容量。容量为 1 时可以同时有 `B=OCCUPIED(G1-01)` 和 `B=WAITING(G1-02)`；其他机器人可继续排队，但不能越过首位直接取得 B。若 B 容量大于 1，则按空余名额逐个兑现候补，不把展台写死为互斥资源。增加机器人数量只会增加该展台的排队记录，不要求拆成两张表。
 
 | 时刻 | B 的容量记录 | G1-02 在 A 的行为 | Java 平台动作 |
 |---|---|---|---|
@@ -593,77 +593,64 @@ WHERE task_id = :taskId
 
 G1-02 在 A 的等待内容必须属于 A：开放问答走当前展台的 RAG，补充讲稿只能选已发布资源；**不能让模型临时编一段控制动作或未审核讲稿**。若 A 需要让位、访客不愿继续听，或 B 长时间未释放，则去预设安全等待点、提出换序草案或交工作人员。机器人到 A 讲完正文不等于 A 的占用结束；第二组仍在问答时仍占 A。机器人 1 在 B 提前收尾可以作为工作人员授权的选择，但先要确认它下一站或等待点可用；本场景的默认做法不依赖打断第一组。
 
-**关键操作分为三个短事务，中间没有长时间数据库锁。**下面的服务层代码用于阅读调用顺序；字段、SQL、接口合同、清场权限、竞态处理和验收条件以 [V2 实施设计](/central-scheduling-v2-design) 为准。Repository、事件认证和端侧适配器名称不是已验收 Java 工程中的现成类：
+**关键操作分为三个短事务，中间没有长时间数据库锁。**下面是服务层流程示意；真实字段、SQL、清场权限、竞态处理和验收条件以 [V2 实施设计](/central-scheduling-v2-design) 为准。这些 Repository 和设备事件不是已验收工程的现成类：
 
 ~~~java
-// 第一次：G1-02 在 A 请求去 B。事务只保护当前状态与排队顺位，不等待模型或机器人。
+// 第一次：G1-02 在 A 请求去 B；重复 NEXT 返回同一条申请。
 @Transactional
 public AdvanceResult requestNext(AdvanceRequest req) {
-    ReceptionTask task = tasks.lockById(req.taskId()); // 同一任务的 NEXT/改线/取消共用入口
-    requireExpectedVersion(task, req);
-    requireCurrentStepReady(task, req.fromStepId());
-    if (operations.exists(req.taskId(), req.requestId())) {
-        return operations.replayOrRejectDifferentPayload(req); // 网络重试不插入第二条候补
-    }
+    Exhibit booth = exhibits.lockByCode(req.targetExhibitCode()); // 所有 B 申请先锁 B
+    ReceptionTask task = tasks.lockById(req.taskId());
+    requireApprovedStepAndRobot(task, req, booth);
+    ExhibitAllocation current = allocations.findActiveForStep(task.currentStep());
+    if (current != null) return resultFor(current); // 部分唯一索引防止并发插入两行
 
-    String target = steps.nextExhibit(task); // 只从已审核的剩余路线取 B
-    robots.lockAssignment(task.robotId());
-    exhibits.lockByCode(target);             // 本次尝试和其他占用写入串行化
-    if (exhibits.tryTakeSlot(target) == 1) {
-        // 普通路径：预约、Command、outbox、操作结果同事务；提交后才发送。
-        return dispatchCurrentStep(task, target, req.requestId());
+    allocations.promoteEligibleWaitersWithinCapacity(booth); // 先照顾已排队者
+    if (booth.hasFreeSlot() && !allocations.hasWaiting(booth.code())) {
+        booth.takeOneSlot();
+        ExhibitAllocation hold = allocations.insertReserved(task, booth.code());
+        // 若 A 的回答未结束，只占短时名额，不创建去 B 的 VISIT。
+        return dispatchIfReadyOrPending(task, hold);
     }
-
-    WaitClaim claim = claims.insertOrReuseWaiting(task, target, req.requestId());
-    operations.saveWaiting(req, claim.id());
-    // 不推进 A 的 Step，也不创建“去 B”的命令；前端显示 B 正被占用。
-    return AdvanceResult.waiting(claim.id(), target);
+    ExhibitAllocation waiting = allocations.insertWaiting(task, booth.code());
+    return AdvanceResult.waiting(waiting.id()); // 不占 B 容量，也不发导航
 }
 
-// 第二次：消费经验证的 B 清场事件。先释放原占用，再把候补首位转为短时预约。
+// 第二次：确认 G1-01 与访客组都离开 B，同一事务释放并兑现队首。
 @Transactional
 public void onBoothCleared(ClearedEvent event) {
-    ReceptionTask owner = tasks.lockById(event.taskId());
     Exhibit booth = exhibits.lockByCode(event.exhibitCode());
-    Reservation old = reservations.lockById(event.reservationId());
-    requireAuthenticCurrentEvent(owner, old, event); // 重复、旧命令、仅“讲完”均不能清场
-    if (old.isReleased()) return;                    // 清场事件重投只释放一次
+    ReceptionTask owner = tasks.lockById(event.taskId());
+    ExhibitAllocation old = allocations.lockById(event.allocationId());
+    requireAuthenticDepartureAndOperatorConfirmation(owner, old, event);
+    if (old.isReleased()) return; // 重复事件不重复减名额
 
     old.markReleased();
     booth.releaseOneSlot();
-    WaitClaim first = claims.lockFirstWaiting(booth.code()); // 同优先级 FIFO
+    ExhibitAllocation first = allocations.firstValidWaiting(booth.code());
     if (first == null || !booth.isOpen()) return;
-
-    booth.takeOneSlot(); // 同事务扣回刚释放的容量；第三台不能插队
-    Reservation hold = reservations.createForClaim(first.id(), booth.code(),
-            handoffDeadline()); // 尚未下发 Command，短时窗口用于 A 的当前回答收尾
-    first.markPromoted(hold.id());
-    notifications.saveOutbox(first.taskId(), "BOOTH_RESERVED", hold.id());
+    booth.takeOneSlot();
+    first.markReserved(handoffDeadline()); // WAITING → RESERVED，仍是同一行
+    notifications.saveOutbox(first.taskId(), "BOOTH_RESERVED", first.id());
 }
 
-// G1-02 收到“当前回答已结束”后再进入此短事务，不能拿着旧排队结果直接出发。
+// 第三次：G1-02 当前回答结束后再校验，不能凭旧排队结果直接出发。
 @Transactional
-public DispatchResult finishAnswerAndDispatch(long claimId, String answerDoneEventId) {
-    WaitClaim snapshot = claims.find(claimId);
-    ReceptionTask task = tasks.lockById(snapshot.taskId());
-    robots.lockAssignment(task.robotId());
+public DispatchResult finishAnswerAndDispatch(long allocationId, String doneEventId) {
+    ExhibitAllocation snapshot = allocations.find(allocationId);
     Exhibit booth = exhibits.lockByCode(snapshot.exhibitCode());
-    WaitClaim claim = claims.lockById(claimId);
-    Reservation hold = reservations.lockById(claim.reservationId());
-    requirePromotedAndUnexpired(claim, hold);
-    requireAnswerDoneForHold(task, hold, answerDoneEventId); // 关联本次收尾，拒绝旧播报事件
-    requireRouteAndRobotStillValid(task, claim, booth); // 取消、改线、离线时拒绝
-
-    Command command = commands.createVisit(task, claim.targetStepId(), booth.code());
-    hold.bindCommand(command.id());         // 此后超时不能自动释放 B，须核对物理状态
-    claim.markClaimed();                     // PROMOTED → CLAIMED，不再占活跃候补位
-    task.advanceTo(claim.targetStepId());   // 仅此时推进 Step/任务版本
-    outbox.save(command);                   // 提交后发送器投递同一 commandId
+    ReceptionTask task = tasks.lockById(snapshot.taskId());
+    ExhibitAllocation hold = allocations.lockById(allocationId);
+    requireReservedUnexpiredAndCurrentPlan(task, hold, booth, doneEventId);
+    Command command = commands.createVisit(task, hold.targetStepId(), booth.code());
+    hold.bindCommand(command.id()); // 有命令后不能靠预约超时释放 B
+    task.advanceTo(hold.targetStepId());
+    outbox.save(command);           // 提交后才投递同一个 commandId
     return DispatchResult.queued(command.id());
 }
 ~~~
 
-`exhibit_wait_claim` 至少保存 `claimId、exhibitCode、taskId、targetStepId、queueNo、status、reservationId、创建时间`，按 `(exhibitCode,status,queueNo)` 查首位；同一任务的活跃 `claimId` 由任务行或唯一约束限制，重复 NEXT 不能插出多个顺位。取消/改线也要在任务事务中撤销候补或释放**尚未下发**的短时预约；所有释放容量的路径都要尝试兑现下一顺位，不能只在机器人正常离场时处理。清场事务只锁原任务、B 展台及候补行，不在持有 B 锁时反向锁候补任务，避免和 NEXT 的“任务→展台”顺序形成锁环。候补任务在真正下发前再次校验任务版本；若已取消，释放短时预约并通知下一顺位。B 关闭时不兑现候补，而是通知等待中的工作人员改线或暂停。
+`exhibit_allocation` 保存 `allocationId、exhibitCode、taskId、stepNo、planVersion、robotId、priority、state、leaseUntil`。同一步骤最多一条活跃记录；`WAITING` 不占容量，`RESERVED/OCCUPIED/UNKNOWN` 占容量。按 `(exhibitCode, priority DESC, allocationId)` 兑现队首，释放和状态转换都持有展台行短锁。取消/改线要撤销旧 WAITING；若已有 RESERVED，只在确认尚未发命令时释放名额并尝试兑现下一顺位。B 关闭或设备状态未知时不强行放号。上面代码只表达调用顺序，生产实现须保持所有入口一致的锁顺序、幂等和条件更新。
 
 短时预约的期限是**可配置的收尾窗口**，不是对导航耗时的预测。只在 `RESERVED` 且尚无 Command/outbox、确认机器人未出发时，超时处理器才能撤销预约并兑现下一顺位；已有命令或执行状态不明则标 `UNKNOWN` 并对账，绝不能靠 TTL 把 B 重新分配。G1-02 从 A 出发后，只有确认接待组和机器人离开 A，才释放 A；短暂同时占用 A 与 B 的容量是为了避免两个展台都误判为空闲。
 
