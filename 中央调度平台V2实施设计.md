@@ -22,7 +22,7 @@
 
 ### 0.1 需求与不做的事
 
-P0 是可交付闭环：展台/讲稿/点位映射管理，机器人事件与心跳形成可检验的状态快照；**Java 先查询并过滤**候选机器人、展台及硬约束，再由中央规划 Agent 按需查询展台偏好和业务背景，生成「建议机器人 + 路线」草案，接受 Java 校验反馈作有限次修订；工作人员审核后才取得机器人控制权并下发。ASR 文字经**严格规则优先、复杂语义再由无工具意图 ChatClient 分类**：复杂运动请求进入机器人控制 Agent，问题进入可选择 RAG/天气/受控联网工具的知识问答 Agent，规划或改线请求进入中央规划 Agent。所有副作用工具先经过 Java 权限、状态和幂等门禁；另有候补预约、设备命令/事件、审计及人工接管。P1 是等待时的备用讲稿、清场通知、有限重规划、知识版本回滚及运维报表。P2 是跨楼层接力、真正的动态 ETA、人流感知、巡检任务复用。**四个月内先保证 P0 真机闭环，P1 按里程碑推进，P2 只留扩展口。**
+P0 是可交付闭环：展台/讲稿/点位映射管理，机器人事件与心跳形成可检验的状态快照；**Java 先查询并过滤**候选机器人、展台及硬约束，再由中央规划 Agent 按需查询展台偏好和业务背景，生成「建议机器人 + 路线」草案，接受 Java 校验反馈作有限次修订；工作人员审核后才取得机器人控制权并下发。ASR 文字经**严格规则优先、复杂语义再由无工具意图 ChatClient 分类**：复杂运动请求进入机器人控制 Agent，问题进入可按需选择展台向量检索、天气或受控联网工具的知识问答 Agent，规划或改线请求进入中央规划 Agent。所有副作用工具先经过 Java 权限、状态和幂等门禁；另有候补预约、设备命令/事件、审计及人工接管。P1 是等待时的备用讲稿、清场通知、有限重规划、知识版本回滚及运维报表。P2 是跨楼层接力、真正的动态 ETA、人流感知、巡检任务复用。**四个月内先保证 P0 真机闭环，P1 按里程碑推进，P2 只留扩展口。**
 
 约束：一个机器人同一时刻至多执行一个接待任务；每个展台的接待容量可配置，默认 1 只是初始化值；机器人本地保有安全控制权；没有实测行走时间就不承诺精确到达时间；讲解结束不等于访客组离开展台；模型响应、设备反馈和网络请求都可能重复、延迟、乱序、丢失。
 
@@ -52,7 +52,7 @@ P0 是可交付闭环：展台/讲稿/点位映射管理，机器人事件与心
 │        ┌─────────────────────────────┼─────────────────────────────┐        │
 │        ▼                             ▼                             ▼        │
 │ 机器人控制 Agent              知识问答 Agent                 中央规划 Agent  │
-│ 受控机器人技能工具       RAG/天气/受控联网查询工具     展台偏好/规划知识工具  │
+│ 受控机器人技能工具  展台向量检索/天气/联网只读工具    展台偏好/规划知识工具  │
 │        │                             │                  ▲ Java 预取硬约束    │
 │        └──────── Java 权限、状态、参数、预算与幂等校验 ─────────────┘        │
 │                         │ RobotCommand / Answer / PlanDraft                  │
@@ -73,20 +73,48 @@ bot_mind 中央接入增强：平台 Token、commandId 去重、命令状态与�
 
 **人机请求**：接待员在页面经 OIDC 授权码 + PKCE 登录；浏览器带短期 Access Token 调 Java；Java 验签并检查角色和任务权限，所有变更记 requestId/操作者。规划草案生成在事务外；入库、审核、任务推进是短事务。**机器人链路**：Java 根据受控 `robot_registry` 取得固定 IP 和密钥引用，携每台机器人独立的平台 Token 调用 `/mcp`；`bot_mind` 的事件、心跳和 ASR 回调携独立机器人凭据，Java 从凭据映射 robotId，不相信报文自称的身份。人员身份与机器人链路的密钥、限流和审计分开。
 
-**模型路由**：明确的 UI 动作以及整句“停止”“下一地点”等白名单命令直接进入 Java 业务服务；其余复杂语音才交无工具的意图 ChatClient，输出 `ROBOT_CONTROL`、`KNOWLEDGE_QA`、`CENTRAL_PLANNING` 或 `OTHER`。机器人控制 Agent 从本次请求允许的机器人技能中选择工具和参数；知识问答 Agent 自主判断使用当前展台 RAG、天气、受控联网查询或直接寒暄；中央规划 Agent 基于 Java 预取的候选与硬约束，按需查询展台偏好，生成并修订计划草案。四个 ChatClient 可共用一个 ChatModel，但分别拥有提示词、工具白名单、超时和输出契约。模型负责语义理解、工具选择和草案生成；身份权限、展台预约、数据库事务、命令幂等、人工审核与最终执行权属于 Java。
+**模型路由**：明确的 UI 动作以及整句“停止”“下一地点”等白名单命令直接进入 Java 业务服务；其余复杂语音才交无工具的意图 ChatClient，输出 `ROBOT_CONTROL`、`KNOWLEDGE_QA`、`CENTRAL_PLANNING` 或 `OTHER`。机器人控制 Agent 从本次请求允许的机器人技能中选择工具和参数；知识问答 Agent 自主判断调用当前展台向量检索、天气、受控联网查询或直接寒暄，其中“检索片段再生成答案”的完整链路才称为 RAG；中央规划 Agent 基于 Java 预取的候选与硬约束，按需查询展台偏好，生成并修订计划草案。四个 ChatClient 可共用一个 ChatModel，但分别拥有提示词、工具白名单、超时和输出契约。模型负责语义理解、工具选择和草案生成；身份权限、展台预约、数据库事务、命令幂等、人工审核与最终执行权属于 Java。
 
 ### 1.1 组件选型反思：以 2026 年 2 月冻结依赖
 
 | 组件与基线 | 选择理由 | 不选择的替代方案及门槛 |
 |---|---|---|
 | Java 17、Spring Boot 3.4.x、Spring Security 6.4.x | 2024 年已发布的成熟组合，便于四个月交付；锁定补丁版本并跑兼容测试 | 不为了“新”采用项目开始后才稳定的框架 API |
-| Spring AI **1.0.0**、Spring AI BOM 固定版本 | [1.0 GA 在 2025-05 发布](https://spring.io/blog/2025/05/20/spring-ai-1-0-GA-released/)；[1.0 文档支持 Boot 3.4.x](https://docs.spring.io/spring-ai/reference/1.0/getting-started.html)；ChatClient、模型抽象与 RAG 接口可用 | 不引用 Spring AI 2.0 的验证 Advisor；如模型供应商不兼容，保留 ChatModel 适配层 |
+| Spring AI Alibaba **1.1.0.0** + Spring AI **1.1.0**，BOM 固定版本 | Spring AI Alibaba 1.1.0.0 于 2025-12-30 发布，官方兼容表对应 Spring Boot 3.4.x；使用 DashScope/模型适配、ChatClient、Tool Calling 与 RAG 抽象 | 不引用 2026-02 之后才发布的 1.1.2.1+ 能力；当前四客户端由 Java 编排，不为框架标签强行引入 Graph/ReactAgent |
 | [Nginx 1.26.x](https://nginx.org/2024.html) 统一反向代理 + Spring Security | 一个展厅、一个 Java 服务，无需额外网关集群；TLS、路径、体积限制、基础限流集中 | Spring Cloud Gateway 对本规模增加部署和故障面；不是“企业级”的必要条件 |
 | [Keycloak 26.0](https://www.keycloak.org/2024/10/keycloak-2600-released) 或可对接的企业 OIDC | 不自造人员密码体系；26.0 于 2024 年已发布。两台固定 IP 机器人使用独立平台 Token/TLS，不强行接入完整 OIDC | 若甲方已有身份平台，替换 IdP 配置和 claim 映射，不复制账号库；设备规模扩大后再评估 mTLS/OAuth2 |
 | PostgreSQL 16 + [pgvector 0.8.1](https://github.com/pgvector/pgvector/blob/master/CHANGELOG.md) | 一个数据库同时保存事务事实和小规模知识向量；0.8.1 于 2025 年发布 | 若现场强制 MySQL，业务库留 MySQL、RAG 独立 pgvector；必须承认双库运维成本，不能在两个库做跨库事务 |
 | Flyway、Actuator/Micrometer、JUnit 5/Testcontainers | 可复现迁移、运行健康和并发测试，均为成熟能力 | Redis、Kafka、复杂链路平台在 P0 非必要；不拿缓存做占用唯一事实 |
 
-以上是**目标依赖版本**，不是对原验收系统版本的断言。Nginx/Keycloak/数据库的运行包与安全补丁应在项目锁版会议上确定并记录 SBOM。模型型号、推理硬件、延迟和部署方式要在 2 月联调前实测；本文不杜撰性能数字。
+依赖由 BOM 对齐，不单独覆盖其中的 Spring AI 小版本：
+
+~~~xml
+<dependencyManagement>
+  <dependencies>
+    <dependency>
+      <groupId>com.alibaba.cloud.ai</groupId>
+      <artifactId>spring-ai-alibaba-bom</artifactId>
+      <version>1.1.0.0</version>
+      <type>pom</type>
+      <scope>import</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.ai</groupId>
+      <artifactId>spring-ai-bom</artifactId>
+      <version>1.1.0</version>
+      <type>pom</type>
+      <scope>import</scope>
+    </dependency>
+  </dependencies>
+</dependencyManagement>
+
+<dependency>
+  <groupId>com.alibaba.cloud.ai</groupId>
+  <artifactId>spring-ai-alibaba-starter-dashscope</artifactId>
+</dependency>
+~~~
+
+以上是**目标依赖版本**，不是对原验收系统版本的断言。若最终 `pom.xml` 证明确实使用其他 Spring AI Alibaba 版本，应以构建文件和锁版记录为准，不能凭记忆补版本号。Nginx/Keycloak/数据库的运行包与安全补丁应在项目锁版会议上确定并记录 SBOM。模型型号、推理硬件、延迟和部署方式要在 2 月联调前实测；本文不杜撰性能数字。
 
 ## 2. Java 工程组织与端到端业务
 
@@ -100,7 +128,7 @@ platform/
   ai/planning/     Java 候选预取、可选规划知识工具、路线生成、校验反馈修订
   ai/intent/       严格语音规则路由、复杂语义分类、澄清回复
   ai/control/      机器人控制 Agent、每请求工具白名单、参数与执行结果校验
-  ai/qa/           RAG/天气/联网工具、问答生成、引用检查、安全播报
+  ai/qa/           向量检索/天气/联网工具、RAG 问答生成、引用检查、安全播报
   scheduler/       展台申请/容量、机器人分配与短事务
   device/          RobotGateway、RobotCommand 投递、事件 inbox、心跳与对账
   operations/      人工清场、告警、回放与统计
@@ -156,7 +184,7 @@ Task 与 Command 不能混成一个状态：Task 在 B 等待时仍 RUNNING，�
 bot_mind ASR/中央接入回调文字与事件 → Java Event Inbox 更新 robot_runtime_state
        → Java 严格规则路由：整句“下一地点” → REQUEST_NEXT
                           不明确/复杂表达 → 意图 ChatClient → 受限顶层路由
-       → KNOWLEDGE_QA：问答 Agent 按需选择展台 RAG/天气/联网工具 → 回复
+       → KNOWLEDGE_QA：问答 Agent 按需选择展台向量检索/天气/联网工具 → 回复
        → ROBOT_CONTROL：控制 Agent 选择受控技能与参数 → Java 门禁
        → CENTRAL_PLANNING：规划 Agent 生成初始或剩余路线草案 → 人工审核
        → REQUEST_NEXT（规则直达或控制语义）：Java 查状态/任务/权限/目标展台
@@ -191,7 +219,7 @@ bot_mind ASR/中央接入回调文字与事件 → Java Event Inbox 更新 robot
 
 ## 4. 四个 ChatClient：一个轻量分类器与三个专业 Agent
 
-采用一个受控 ChatModel，加四个独立 ChatClient bean；它们可以共用底层模型连接，但提示词、工具、超时、温度、输出 DTO 和评测集必须分开。`intentClient` 不注册任何工具，只做路由；`robotControlClient`、`qaClient`、`planningClient` 分别绑定本领域的受限工具。不同模型可后换，业务接口不变。下例只使用 Spring AI 1.0 的 ChatClient.builder、prompt、system/user、call/content；**模型输入、工具参数和模型返回一律按不可信数据处理**。不要把新版本的 schema validation advisor 当成 2026 年 2 月可用能力。
+采用 Spring AI Alibaba 管理的受控 ChatModel（例如经锁版的 DashScopeChatModel），加四个独立 ChatClient bean；Spring AI Alibaba 构建在 Spring AI 抽象之上，因此这里仍使用底层 `ChatClient`、`ChatModel`、Advisor 和 ToolCallback API。四个客户端可以共用底层模型连接，但提示词、工具、超时、温度、输出 DTO 和评测集必须分开。`intentClient` 不注册任何工具，只做路由；`robotControlClient`、`qaClient`、`planningClient` 分别绑定本领域的受限工具。不同模型可后换，业务接口不变。下例以锁定的 Spring AI Alibaba 1.1.0.0 / Spring AI 1.1.0 API 为基线；**模型输入、工具参数和模型返回一律按不可信数据处理**。不要把后续 1.1.2.x/2.x 的 Agent Skills、验证 Advisor 或新 Graph API 倒写进 2026 年 2 月的基线。
 
 ~~~java
 @Configuration
@@ -218,13 +246,13 @@ class AiClientConfig {
 }
 ~~~
 
-如项目里还存在自动配置的 ChatClient.Builder，可显式设置 spring.ai.chat.client.enabled=false 并用 ChatModel 手动创建上述 bean；以锁定的 Spring AI 1.0.0 做编译验证。四个 bean 本身不构成安全边界，真正的边界在各自 Application Service 的上下文绑定、工具白名单、输入输出校验和权限检查。temperature、maxTokens、模型名、超时在每个能力的配置中固定并版本化；意图、控制和规划使用低 temperature，问答也不以高随机性追求“生动”。工具按**每次请求**注册：控制 Agent 只看到当前机器人、当前状态允许的技能；问答 Agent 看不到任何副作用工具；规划 Agent 看不到导航和动作工具。
+如 Spring AI Alibaba 自动配置提供 ChatClient.Builder，可选择关闭默认 ChatClient 并用其 ChatModel 手动创建上述 bean，具体配置键以锁定版本的自动配置元数据和编译结果为准，不能从别的版本照抄。以 Spring AI Alibaba 1.1.0.0 BOM 做依赖收敛和编译验证。四个 bean 本身不构成安全边界，真正的边界在各自 Application Service 的上下文绑定、工具白名单、输入输出校验和权限检查。temperature、maxTokens、模型名、超时在每个能力的配置中固定并版本化；意图、控制和规划使用低 temperature，问答也不以高随机性追求“生动”。工具按**每次请求**注册：控制 Agent 只看到当前机器人、当前状态允许的技能；问答 Agent 看不到任何副作用工具；规划 Agent 看不到导航和动作工具。
 
 | ChatClient | 是否配置工具 | 输出或副作用边界 |
 |---|---|---|
 | 意图分类 | 无 | 只返回 `ROBOT_CONTROL`、`KNOWLEDGE_QA`、`CENTRAL_PLANNING`、`OTHER` 及必要槽位 |
 | 机器人控制 Agent | 有，按请求裁剪 | 选择机器人技能和参数；Java 门禁通过后才创建 RobotCommand |
-| 知识问答 Agent | 有，只读 | 自主选择 RAG、天气或受控联网查询，输出答案和来源 |
+| 知识问答 Agent | 有，只读 | 自主选择展台向量检索、天气或受控联网查询；检索增强回答构成 Agentic RAG，输出答案和来源 |
 | 中央规划 Agent | 有，只读 | 查询展台偏好/业务说明，输出待校验、待审核的机器人与路线草案 |
 
 ### 4.1 中央规划 Agent：Java 预取硬约束 → 按需知识检索 → 草案 → 校验反馈修订
@@ -276,14 +304,14 @@ PlanningKnowledgeTools tools = new PlanningKnowledgeTools(
 String raw = planningClient.prompt()
     .system(PLANNING_PROMPT)
     .user(serializeBounded(requirement, evidence)) // 包含候选、硬约束和快照版本
-    .tools(tools)                                    // Spring AI 1.0；按需检索
+    .tools(tools)                                    // SAA 1.1.0.0 / Spring AI 1.1.0
     .call().content();
 PlanDraft draft = parseStrict(raw);
 PlanValidation report = validator.validate(draft, evidence, tools.returnedSnippetIds());
 // 可修正错误只重拟一次；审核/下发仍重新检查机器人和展台状态。
 ~~~
 
-示意代码只说明边界；PlanEvidence、检索结果、服务构造和超时需在正式工程中实现/编译/测试。[Spring AI 1.0 Tool Calling](https://docs.spring.io/spring-ai/reference/1.0/api/tools.html)支持 @Tool 与 ChatClient 的 .tools(...)。模型服务若不支持工具调用，**必需的规划仍可运行**：Java 已预取硬约束，软背景由 Java 在确有需要时确定性检索并限量附入 Prompt，或交工作人员补充；不能假称模型自主调用过知识工具。规划知识工具仅允许已审核资料、任务/展厅作用域、候选展台过滤、最多两次调用和限长返回；记录 sourceId/版本/片段 ID，检索失败不放宽硬约束。
+示意代码只说明边界；PlanEvidence、检索结果、服务构造和超时需在正式工程中实现/编译/测试。Spring AI Alibaba 1.1.0.0 复用 Spring AI 1.1.0 的 `@Tool`、ToolCallback 与 ChatClient `.tools(...)` 调用链；模型服务若不支持工具调用，**必需的规划仍可运行**：Java 已预取硬约束，软背景由 Java 在确有需要时确定性检索并限量附入 Prompt，或交工作人员补充；不能假称模型自主调用过知识工具。规划知识工具仅允许已审核资料、任务/展厅作用域、候选展台过滤、最多两次调用和限长返回；记录 sourceId/版本/片段 ID，检索失败不放宽硬约束。
 
 系统提示词（版本 planning-v2，随调用保存 promptVersion/modelVersion/inputSnapshotVersion/knowledgeVersion）：
 
@@ -425,11 +453,13 @@ final class RobotControlTools {
 
 工具返回 `ACCEPTED/WAITING/REJECTED/UNKNOWN`、commandId 和可公开原因。`ACCEPTED` 只表示命令已写入 Java 的可靠队列，不能让模型播报“动作已经完成”；只有 `bot_mind` 回调与 commandId 对应的 `SUCCEEDED` 才能推进状态。若后续确需开放复合动作，必须先把组合固化为 Java/机器人中央接入模块的有序 ActionSequence：前一步成功事件到达后再派发下一步，并为取消、补偿和超时建模；模型只能选择已发布的 sequenceCode。
 
-### 4.4 知识问答 Agent：由模型选择 RAG、天气或受控联网工具
+### 4.4 知识问答 Agent：由模型选择展台向量检索、天气或受控联网工具
+
+RAG 与 Tool Calling 不在同一维度。RAG 是“检索证据 → 将证据加入上下文 → 基于证据生成答案”的工作流；Tool Calling 是模型选择并调用 Java 方法的机制。V2 不给 `qaClient` 默认挂载 `QuestionAnswerAdvisor`，因为那会让每个问题（包括“你好”“今天天气如何”）都先检索知识库。这里把 Retrieval 阶段封装为只读 `@Tool searchCurrentExhibitKnowledge`：模型判断问题与当前展台知识有关时才调用，Java 检索 pgvector 并返回带引用 ID 的片段，模型再基于片段回答，这一链路属于 **Agentic RAG**。若未来某个固定问答入口要求每次都检索，可单独使用 Advisor，但不能把两种流程混写成同一个实现。
 
 知识问答不是“每个问题固定先查 RAG”。Agent 根据问题语义自主选择三类只读工具：当前展台知识 `searchCurrentExhibitKnowledge`、天气 `queryWeather`、受控联网查询 `searchApprovedWeb`。例如“这个装置怎样散热”调用当前展台 RAG；“今天兰州天气如何”只调用天气工具；需要时效性的公开行业信息才调用受控联网工具；寒暄可以零工具直接回答。工具结果返回模型后再生成适合语音播报的答案，因此“模型驱动”体现在**是否调用、调用哪个工具以及如何组织证据**，不是让意图分类器背负全部工具。
 
-知识管理员上传经版权/内容审核的展台文档，标注 exhibitCode、sourceId、version、title、page/section；解析分块（初始 300–600 中文字，带少量重叠，实际以评测调参），计算 embedding 存 pgvector。知识版本先构建、验证索引，再原子切换 published_version。RAG 工具在 Java 创建时绑定当前 Task/Step 的 exhibitCode 和 published_version，模型参数中不提供可篡改的 exhibitCode。检索先过滤作用域再取 topK（初始 4，可测），做阈值与去重；仅返回截断片段和引用 ID。EmbeddingModel 的标识、维度和距离度量写入索引元数据，更换模型必须全量重建。
+知识管理员上传经版权/内容审核的展台文档，标注 exhibitCode、sourceId、version、title、page/section；解析分块（初始 300–600 中文字，带少量重叠，实际以评测调参），计算 embedding 存 pgvector。知识版本先构建、验证索引，再原子切换 published_version。展台向量检索工具（即 RAG 的 Retrieval 阶段）在 Java 创建时绑定当前 Task/Step 的 exhibitCode 和 published_version，模型参数中不提供可篡改的 exhibitCode。检索先过滤作用域再取 topK（初始 4，可测），做阈值与去重；仅返回截断片段和引用 ID。EmbeddingModel 的标识、维度和距离度量写入索引元数据，更换模型必须全量重建。
 
 天气和联网查询均由 Java 封装：设置域名/供应商白名单、连接与总超时、响应体上限、字符集与内容类型检查、缓存时效、脱敏、来源 URL 和查询时间。模型不能提交任意 URL，也不能取得内网地址、请求头、密钥或原始 HTTP 客户端。单轮默认最多 2 次工具调用、最多 1 次联网查询；失败返回结构化 `TOOL_UNAVAILABLE/NO_EVIDENCE`，不让模型用常识补写实时事实。
 
@@ -476,7 +506,7 @@ Java 检查 evidenceIds 确实来自本轮工具结果，来源类型和 `asOf` 
 
 ### 4.5 模型不稳定：格式、语义、工具与依赖故障分层处理
 
-对规划/意图/控制/QA 结构化结果统一实行：**调用限时 → 原文限长 → 严格 JSON 解析 → JSON Schema 或 DTO 字段检查 → 业务语义校验 → 版本再确认 → 决策入库**。工具调用额外校验工具名白名单、参数 schema、调用预算、上下文绑定和结果证据；工具超时不等于执行失败，副作用工具事实不明时标 UNKNOWN 并对账。可剥离完整的 Markdown 代码围栏和 BOM；不要用“截取第一个 { 之后”“删除多余逗号”“JSON5 容错”自动修补模型的错误内容，因为这样可能把错误前后文藏起来、造成意外执行。Spring AI 1.0 的 entity/BeanOutputConverter 可以辅助格式引导，但不是业务校验。若模型服务明确支持 JSON Schema/guided decoding，可在适配层开启，同时保留 Java 严格校验；不能把 vLLM 某版本能力无条件写成系统已启用。
+对规划/意图/控制/QA 结构化结果统一实行：**调用限时 → 原文限长 → 严格 JSON 解析 → JSON Schema 或 DTO 字段检查 → 业务语义校验 → 版本再确认 → 决策入库**。工具调用额外校验工具名白名单、参数 schema、调用预算、上下文绑定和结果证据；工具超时不等于执行失败，副作用工具事实不明时标 UNKNOWN 并对账。可剥离完整的 Markdown 代码围栏和 BOM；不要用“截取第一个 { 之后”“删除多余逗号”“JSON5 容错”自动修补模型的错误内容，因为这样可能把错误前后文藏起来、造成意外执行。Spring AI Alibaba 复用的 BeanOutputConverter/结构化输出提示可以辅助格式引导，但不是业务校验。若模型服务明确支持 JSON Schema/guided decoding，可在适配层开启，同时保留 Java 严格校验；不能把其他模型或后续框架版本的能力无条件写成系统已启用。
 
 规划 Agent 的闭环是 **Planner → Java Validator → Reviser → Java Validator**，最多一次内容修订；这是外部校验器反馈的有限反思循环，而不是模型自行反复发导航指令。可纠正的错误包括漏掉仍开放的必看站、重复展台、建议机器人不在候选集合、少字段/非法 JSON。反馈包含前一版草案、有限的错误码与允许集合，不能只塞一段异常堆栈让模型猜。若需求本身矛盾（例如 B 必看但已关闭）、候选已变、权限不符、数据库状态冲突或模型两次不合格，就终止模型修订并交人工/重新取快照；不要反复调用到“碰巧合法”。模型响应与最终审核还需再检查快照版本。
 
@@ -834,7 +864,7 @@ utterances 入口先持久化并 ACK 事件，再异步执行严格规则路由�
 1. 知识管理员发布展台 A/B 讲稿与问答资料，展台目录绑定经真机验证的 waypointCode；未发布版本不能被 QA 检索。
 2. 接待员创建 Task，输入访客偏好与必看展台；Java 先预取候选机器人/展台快照，中央规划 Agent 可按需检索展台偏好和业务说明，再提出 suggestedRobotId + 路线 DRAFT。Java 做严格解析与业务校验，把可修正错误反馈模型再修订一次，记录输入快照、工具调用与知识版本、promptVersion/modelVersion 和报告。审核员可修改建议并 approve，形成 immutable planVersion。
 3. 工作人员点击下发：Java 重读建议机器人的最新心跳/楼层/控制权，以 DB 条件更新抢占 assignmentEpoch；若候选已失效，返回重新审核，不自动换 R2。必要时 RobotGateway 经固定 IP 获取只读快照。Java 在出发前预约首站并写 `RobotCommand(state=NEW)`；事务提交后 Dispatcher 读取受控地址和 Token，直调该机器人 `/mcp tools/call navigate_to`。
-4. 导航过程由 bot_mind/g1_base 自行规划和避障；Java 只接受导航事件。ARRIVED 后 ExhibitAllocation 进入 OCCUPIED，Java 再通过 RobotGateway 调 `tools/call booth_show` 开始讲解。bot_mind 中央接入模块将 ASR 文字和状态事件回调 Java；严格规则先识别完整短命令，未命中的复杂表达交无工具意图 ChatClient。控制语义进入机器人控制 Agent，由模型选择受限技能，Java 门禁后写 Command，Dispatcher 再直调本机 `tools/call`；问答语义进入知识问答 Agent，由模型按需选择当前展台 RAG、天气或受控联网工具。NEXT 无论来自规则还是复杂语义，Java 都查询运行状态、权限和目标容量；状态旧时先走 STATE_PROBE。真实播报/动作/导航完成事件才允许推进步骤。
+4. 导航过程由 bot_mind/g1_base 自行规划和避障；Java 只接受导航事件。ARRIVED 后 ExhibitAllocation 进入 OCCUPIED，Java 再通过 RobotGateway 调 `tools/call booth_show` 开始讲解。bot_mind 中央接入模块将 ASR 文字和状态事件回调 Java；严格规则先识别完整短命令，未命中的复杂表达交无工具意图 ChatClient。控制语义进入机器人控制 Agent，由模型选择受限技能，Java 门禁后写 Command，Dispatcher 再直调本机 `tools/call`；问答语义进入知识问答 Agent，由模型按需选择当前展台向量检索、天气或受控联网工具，调用向量检索后的回答构成 Agentic RAG。NEXT 无论来自规则还是复杂语义，Java 都查询运行状态、权限和目标容量；状态旧时先走 STATE_PROBE。真实播报/动作/导航完成事件才允许推进步骤。
 5. 要去下一站 B 时先预约 B；满额则 Task/Step 进入 WAITING，机器人留在当前位置，用户获得解释和备用内容。B 清场时按 T2 晋升，按 T3 兑现后才导航。
 6. 最后一个展台真正清场、所有普通命令终结后，Java 在同一短事务将 Task 置 COMPLETED、robot_registry.control_state 置 IDLE；异常则 PAUSED/NEEDS_OPERATOR 并保持机器人控制权，人工操作记录原因、证据和版本，绝不把 UNKNOWN 自动改成成功或自动释放机器人。
 
@@ -869,7 +899,7 @@ utterances 入口先持久化并 ACK 事件，再异步执行严格规则路由�
 | 时间 | 完成物 | 退出门槛 |
 |---|---|---|
 | 2026-02 | 现场调查、冻结版本与接口、`bot_mind tools/list/tools/call` 真机技能探针、模型工具调用探针、展台/点位/完成事件清单；Java 脚手架、Keycloak/OIDC、Flyway | 核实网络方向、MCP 工具参数、机器人控制和 TTS/动作完成语义；四个 ChatClient 的接口和评测样本冻结 |
-| 2026-03 | 展台/知识管理、Task/Plan 审核、中央规划工具与有限修订、无工具意图路由、问答 RAG/天气/联网工具、版本化评测集 | 工具零次/按需/失败可复现；规则误触发和分类兜底可复现；规划硬约束由 Java 校验，问答来源可追溯 |
+| 2026-03 | 展台/知识管理、Task/Plan 审核、中央规划工具与有限修订、无工具意图路由、问答向量检索/天气/联网工具、Agentic RAG、版本化评测集 | 工具零次/按需/失败可复现；规则误触发和分类兜底可复现；规划硬约束由 Java 校验，问答来源可追溯 |
 | 2026-04 | 机器人控制 Agent 的技能白名单与门禁、展台预约/候补事务、固定 IP RobotGateway、RobotCommand 投递、bot_mind 认证/去重/事件回调；两台机器人联调 | 未授权工具不下发；并发争抢不超容量；具备去重证据后重投不重复执行；动作受理和真实完成可区分 |
 | 2026-05 | 等待体验、人工清场、运维台、故障演练、压测、备份恢复、UAT 与文档 | 业务端到端演示、异常停机/恢复、审核记录、验收证据齐备 |
 
@@ -892,7 +922,7 @@ utterances 入口先持久化并 ACK 事件，再异步执行严格规则路由�
 
 **为什么要先预约再走？**因为目标展台的讲解点位固定；若先导航，另一台机器人可能已占位。预约是数据库短事务中的容量承诺，但并不保证前往途中永远无故障，因此还要命令状态/设备事件和人工清场。**为什么不用读写锁？**读写锁是进程内同步概念，无法表达设备离线、任务版本或“访客尚未离开”的事实；候补是持久化队列，真正短锁只存在于事务内。**为什么模型不直接选择“强制 R1 结束”？**模型不知道当前问题、访客体验和物理位置；Java 可提示最后一个问题，但本机安全和工作人员确认有最终权威。
 
-**为什么不是只有一个 chatbot？**Java 平台有四个独立 ChatClient：无工具意图分类器负责低成本分流；机器人控制 Agent 选择受限设备技能；知识问答 Agent 自主选择 RAG、天气和联网工具；中央规划 Agent 面向接待目标生成可校验、可修订、待审核的机器人和路线草案。三个专业 Agent 的目标、工具集合、输出和评测集不同，不能用一个“大而全”的 Prompt 混在一起。**为什么仍不是三个自治系统？**Agent 不能互相授予权限；Java 掌握身份、状态、预约、事务、命令幂等和人工审核。面试可称“Java 编排的多 Agent 专业化协作”，并明确意图 Client 是分类器、三个专业 Agent 是工具增强工作流。
+**为什么不是只有一个 chatbot？**Java 平台有四个独立 ChatClient：无工具意图分类器负责低成本分流；机器人控制 Agent 选择受限设备技能；知识问答 Agent 自主选择展台向量检索、天气和联网工具，按需形成 Agentic RAG；中央规划 Agent 面向接待目标生成可校验、可修订、待审核的机器人和路线草案。三个专业 Agent 的目标、工具集合、输出和评测集不同，不能用一个“大而全”的 Prompt 混在一起。**为什么仍不是三个自治系统？**Agent 不能互相授予权限；Java 掌握身份、状态、预约、事务、命令幂等和人工审核。面试可称“Java 编排的多 Agent 专业化协作”，并明确意图 Client 是分类器、三个专业 Agent 是工具增强工作流。
 
 **为什么规划知识检索是可选的？**硬约束来自结构化展台目录、机器人台账和状态快照；只有访客偏好需要业务背景解释时才查规划知识，检索不能替代楼层、能力与容量事实。**为什么问答 RAG 也不是固定前置流程？**问答 Agent 面对展品、天气、最新公开信息和寒暄四类问题：展品才查当前展台 RAG，天气查天气工具，最新信息查受控联网工具，寒暄可以零工具。两套知识检索的作用域和证据契约必须分开。**为什么不做复杂微服务？**两机器人、小展厅、四个月周期；单体内模块化、PostgreSQL 事务和 outbox 已覆盖主要一致性风险。
 
@@ -915,7 +945,8 @@ utterances 入口先持久化并 ACK 事件，再异步执行严格规则路由�
 
 ### 版本与原理参考（使用实施期已存在能力）
 
-- [Spring Boot 3.4 发布信息](https://spring.io/blog/2024/11/25/bootiful-34-index/)；[Spring AI 1.0 GA](https://spring.io/blog/2025/05/20/spring-ai-1-0-GA-released/)；[Spring AI 1.0 ChatClient API](https://docs.spring.io/spring-ai/reference/1.0/api/chatclient.html)。在线 1.0 文档可能包含后续 1.0.x 补丁的内容，编码以固定 1.0.0 依赖编译和测试为准。
-- [Spring AI 1.0 Tool Calling](https://docs.spring.io/spring-ai/reference/1.0/api/tools.html)：@Tool、每次请求的 .tools(...) 和工具执行返回模型的基本流程；模型端点是否支持须现场联调。
+- [Spring AI Alibaba 版本兼容表](https://java2ai.com/docs/versions/)；[Spring AI Alibaba CHANGELOG](https://github.com/alibaba/spring-ai-alibaba/blob/main/CHANGELOG.md)：本设计锁定 Spring AI Alibaba 1.1.0.0，对应 Spring AI 1.1.0 与 Spring Boot 3.4.x；实际工程仍以 BOM、构建记录和验收环境为准。
+- [Spring AI ChatClient](https://docs.spring.io/spring-ai/reference/api/chatclient.html)；[Spring AI Tool Calling](https://docs.spring.io/spring-ai/reference/api/tools.html)：Spring AI Alibaba 复用的 ChatClient、`@Tool`、每次请求 `.tools(...)` 和工具结果回传模型的基础机制；端点能力须现场联调。
+- [Spring AI RAG](https://docs.spring.io/spring-ai/reference/api/retrieval-augmented-generation.html)：Advisor 驱动的固定检索与把检索能力封装成工具的 Agentic RAG 是两种编排方式，应按入口需求分别使用。
 - [Spring Security JWT Resource Server](https://docs.spring.io/spring-security/reference/6.5/servlet/oauth2/resource-server/jwt.html)（JWT 原理参考；工程依赖由 Boot 3.4 BOM 固定在实施期可用版本）；[Keycloak 26.0 发布信息](https://www.keycloak.org/2024/10/keycloak-2600-released)。
 - [PostgreSQL 行锁文档](https://www.postgresql.org/docs/16/explicit-locking.html)；[pgvector 版本记录](https://github.com/pgvector/pgvector/blob/master/CHANGELOG.md)。
