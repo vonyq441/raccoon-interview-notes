@@ -1064,6 +1064,228 @@ utterances 入口先持久化并 ACK 事件，再异步执行严格规则路由�
 
 **最值得面试官追问的两个失败点**：其一，JSON 格式正确但路线违反必看/可达条件怎么办？答案是输入前校验、输出后语义校验、版本再确认、人工审核，模型不能覆盖硬约束。其二，命令投递后断网，机器人到底走没走？答案是只有 `bot_mind` 已持久化 commandId/payloadHash 去重时才同 ID 重投；事实不明时标 UNKNOWN，保持名额并查询设备状态/现场对账，不因租期自动放号。
 
+## 10.1 大厂校招补充面试题：KnowledgeQaAgent 工程化追问
+
+### Q：如果 RAG 没有检索到相关内容，你怎么处理？
+
+**推荐回答：**
+
+我的原则是“无证据，不回答内部事实”。RAG 没命中时，工具会返回明确的 `NOT_FOUND` 或空 Evidence，Agent 直接告诉用户当前展台知识库没有足够资料，不让模型靠训练知识补写。如果问题实际是新闻、天气这类公共实时信息，模型可以按工具策略改用 Web Search 或 Weather；但联网结果只能标成公共来源，不能冒充展厅内部资料。
+
+**追问要点：**
+
+- 区分“展厅私有事实没有证据”和“公共知识可以正常回答”。
+- 记录 `evidence_gap`，供知识管理员补充资料和重新发布。
+- 空检索结果不能通过降低阈值无限扩大范围来掩盖。
+
+**一句话记忆：**
+
+> 无证据不回答内部事实，公共信息也必须标清来源。
+
+### Q：Weather API 超时怎么办？
+
+**推荐回答：**
+
+天气是实时事实，所以我会给 Weather Tool 配置连接超时、响应超时和整轮总超时。超时后统一返回 `TIMEOUT/TOOL_UNAVAILABLE`，Agent 只说明天气服务暂时不可用，不能根据模型记忆猜今天多少度或是否下雨。“兰州是什么气候”属于一般知识，可以直接回答；“兰州今天多少度”必须取得实时工具结果。
+
+**追问要点：**
+
+- 超时转换成受控 Tool Result，不把底层异常栈交给模型。
+- 短暂网络故障可有限重试，但必须受总超时约束。
+- 缓存数据必须携带观测时间，过期数据不能称为当前天气。
+
+**一句话记忆：**
+
+> 实时事实禁止模型凭记忆兜底。
+
+### Q：Web Search 挂了怎么办？
+
+**推荐回答：**
+
+Web Search 失败代表一种工具能力降级，不应该让整个问答 Agent 崩溃。工具返回明确的不可用状态；如果用户问“今天、最新、最近发布”，Agent 就说明暂时无法获得最新信息。如果只是稳定的通用知识，模型仍可基于自身知识回答，但必须避免“根据最新搜索结果”之类的表述，也不能把旧知识包装成实时结论。
+
+**追问要点：**
+
+- 区分强实时问题和普通通用知识。
+- 联网失败不自动切换为无来源的实时答案。
+- 记录失败类型、供应商、耗时和 traceId，方便降级分析。
+
+**一句话记忆：**
+
+> 工具失败是能力降级，不是整个 Agent 失败。
+
+### Q：如果 LLM 编造了一个不存在的 evidenceId 怎么办？
+
+**推荐回答：**
+
+我不信任模型声明的引用。每次 RAG、Weather 或 Web Tool 返回证据时，Java 都保存本轮真实 evidenceId 集合；模型输出 `QaAnswer` 后，`QaOutputValidator` 做集合包含校验。比如真实集合是 E101、E102、E103，模型却返回 E101、E999，E999 就是非法引用。结果可以修正一次，仍不合法就走安全降级，不能把伪造引用展示给用户。
+
+~~~java
+for (String evidenceId : answer.evidenceIds()) {
+    if (!actualEvidenceIds.contains(evidenceId)) {
+        throw new InvalidEvidenceException(evidenceId);
+    }
+}
+~~~
+
+**追问要点：**
+
+- actualEvidenceIds 来自本轮 Java Tool Result，不来自模型。
+- 修正时反馈受控错误码，不能把异常堆栈塞回 Prompt。
+- evidenceId 合法仍不等于答案受证据支持，还要做引用相关性评测。
+
+**一句话记忆：**
+
+> 模型可以引用证据，但证据真实性由 Java 定义和校验。
+
+### Q：两个机器人同时发起问答，会不会串上下文？
+
+**推荐回答：**
+
+不会，设计遵循“共享无状态服务，请求级状态隔离”。`KnowledgeQaAgent`、`qaClient`、`ChatModel`、`RagService`、`VectorStore`、Weather 和 Web 服务可以共享；每个请求的 conversationId、`QaTools`、robotId、taskId、stepId、exhibitCode 和 knowledgeVersion 都独立。R1 在 A03 得到 `QaTools(A03)`，R2 在 B05 得到 `QaTools(B05)`，两者可并发使用同一个 ChatClient。
+
+~~~java
+QaTools tools = qaToolFactory.bind(taskId, stepId, robotId);
+~~~
+
+**追问要点：**
+
+- `QaTools` 每轮创建，绑定字段尽量为 `final`。
+- 禁止把带 `currentExhibitCode` 可变字段的 QaTools 做成单例组件。
+- 不同 conversationId 并发，同一 conversationId 的轮次顺序执行。
+
+**一句话记忆：**
+
+> 单例复用无状态能力，请求级对象隔离业务状态。
+
+### Q：机器人从 A03 换到 B05 后，为什么不会带入上一展台的上下文？
+
+**推荐回答：**
+
+这里有双层隔离。第一层是会话隔离：A03 使用 `T100:V2:S3`，进入 B05 后改为 `T100:V2:S4`，也就是稳定的 `taskId:planVersion:stepId`，所以不会加载 A03 的 ChatMemory；同一展台内则复用 ID，可以理解“它有什么优势”。第二层是工具隔离：每轮重新创建 QaTools，A03 绑定 A03 的知识范围，B05 绑定 B05。语义历史和数据访问范围分别受控。
+
+**追问要点：**
+
+- 切换展台不会重建 KnowledgeQaAgent、qaClient 或 ChatModel。
+- 动态变化的是 conversationId 和请求级 QaTools。
+- exhibitCode、knowledgeVersion 来自 Java 当前 TaskStep。
+
+**一句话记忆：**
+
+> conversationId 隔离语义，QaTools 隔离业务数据范围。
+
+### Q：为什么不把 exhibitCode 作为 @Tool 参数让 LLM 自己传？
+
+**推荐回答：**
+
+exhibitCode 是 Task、Step 和机器人当前位置共同确定的业务事实，不是需要模型推理的语义参数。让模型填写可能出现填错、越权访问，或者被聊天历史和提示注入诱导到别的展台。因此 Java 先解析可信当前步骤，再由 `QaToolFactory` 把 exhibitCode 和知识版本封进 QaTools；模型只需要提交自然语言 query。
+
+**追问要点：**
+
+- 工具 schema 中不暴露 exhibitCode 和 knowledgeVersion。
+- 历史里提到 B05，也不能改变当前 A03 的工具范围。
+- Java 在每轮请求重新检查 TaskStep。
+
+**一句话记忆：**
+
+> 业务事实由 Java 绑定，模型只生成检索问题。
+
+### Q：ChatMemory 和 QaTools 有什么区别？
+
+**推荐回答：**
+
+ChatMemory 解决的是“之前聊了什么”，用于理解“它、刚才那个设备”这类指代；QaTools 解决的是“这次允许访问什么”，绑定 robotId、taskId、stepId、exhibitCode 和知识版本。ChatMemory 属于不可信的语义上下文，QaTools 来自 Java 可信业务状态。两者可以同时参与一次请求，但历史内容永远不能扩大工具权限。
+
+**追问要点：**
+
+- ChatMemory 用 conversationId 查找历史消息。
+- QaTools 是请求级、不可变的工具集合。
+- 业务事实优先级高于模型对历史的理解。
+
+**一句话记忆：**
+
+> ChatMemory 管“聊过什么”，QaTools 管“能查什么”。
+
+### Q：为什么每轮都 new QaTools，不在到站时创建一个一直复用？
+
+**推荐回答：**
+
+请求级创建能避免共享可变状态，也让每轮都重新读取可信 TaskStep 和已发布知识版本。任务暂停、步骤切换或知识版本更新后，下一轮马上使用新上下文，不会继续拿旧对象查询。创建一个小型 Java 对象的成本，远低于一次 LLM、向量检索或 HTTP 调用，所以这里优先选择清晰和线程安全，而不是做没有收益的对象缓存。
+
+**追问要点：**
+
+- 工厂负责校验和组装，Agent 不手工拼上下文。
+- 每轮实例独享 evidenceId 集合和调用预算。
+- 服务依赖可以共享，绑定字段不能跨请求修改。
+
+**一句话记忆：**
+
+> QaTools 创建很便宜，隔离状态和及时生效更重要。
+
+### Q：为什么 RAG 做成 Tool，而不是全局 QuestionAnswerAdvisor？
+
+**推荐回答：**
+
+因为问答 Agent 不只回答展台问题。展品知识才需要 RAG，今天的天气走 Weather，最新公开信息走 Web Search，寒暄和普通常识可能零工具。如果给 qaClient 全局挂 `QuestionAnswerAdvisor`，每个问题都会先做向量检索，既增加延迟，也可能给天气问题塞入无关展台片段。Tool 方式允许模型在受控集合中按问题选择能力，更符合这个场景。
+
+**追问要点：**
+
+- RAG 仍包含检索、上下文增强和有证据生成三个阶段。
+- Tool Calling 是触发检索的机制，不等于 RAG 本身。
+- 工具选择必须配离线评测和调用预算。
+
+**一句话记忆：**
+
+> 只有展厅问题走 RAG，其他问题选择对应工具或零工具。
+
+### Q：ChatMemory 为什么不直接放 JVM 内存？
+
+**推荐回答：**
+
+本地 Demo 或单元测试可以用内存实现，但正式运行时 Java 重启会丢历史，多实例也无法共享。项目已经使用 PostgreSQL，所以 P0 用 `MessageWindowChatMemory + JdbcChatMemoryRepository` 复用现有数据库，并通过窗口限制消息数量。两台机器人的规模没有必要只为 ChatMemory 引入 Redis；以后实例数和会话量明显增长，再根据压测决定是否调整。
+
+**追问要点：**
+
+- ChatMemory 是有限上下文，不替代完整审计记录。
+- max-messages 是配置项，需要按 token、延迟和效果评测。
+- PostgreSQL 不可用时不应偷偷退化到另一份 JVM 历史。
+
+**一句话记忆：**
+
+> Demo 可用内存，正式环境复用 PostgreSQL，Redis 留给真实扩容需求。
+
+### Q：Tool 调用失败时要不要自动重试？
+
+**推荐回答：**
+
+不能一概而论。Weather、Web Search 这类只读且幂等的调用，如果确认是短暂网络错误，可以在整轮总超时内做有限次数、带退避的重试；参数错误、无证据和权限拒绝不应重试。超过预算就返回明确不可用状态，让 Agent 降级说明。还要限制整轮工具调用次数，避免模型因为失败不断发起 Tool Calling。
+
+**追问要点：**
+
+- 先按错误类型判断是否可重试。
+- 单次超时、总超时、次数预算必须同时存在。
+- 副作用工具和事实不明状态使用更严格的幂等与对账策略。
+
+**一句话记忆：**
+
+> 只对可证明幂等的瞬时故障有限重试，超过预算立即降级。
+
+### Q：你的知识问答 Agent 是怎么保证可靠性和上下文隔离的？
+
+**推荐回答：**
+
+我的问答 Agent 有两层隔离和两层可信控制。会话层按 Task 的 Plan Step 生成 conversationId，同一展台支持多轮追问，换展台就切换新的 ChatMemory。工具层每轮通过 QaToolFactory 创建请求级 QaTools，把 robotId、taskId、stepId、exhibitCode 和知识版本绑定进去，所以多机器人并发也不会串 RAG 范围。可靠性上，RAG 无证据就不回答内部事实；Weather 和 Web Search 超时返回不可用，实时事实禁止模型凭记忆补写。最后 Java 会把模型声明的 evidenceId 与本轮真实 Tool Result 做集合校验，非法引用修正一次后仍失败就安全降级。
+
+**追问要点：**
+
+- 应用级复用 KnowledgeQaAgent、qaClient 和 ChatModel。
+- conversationId 管语义连续性，QaTools 管访问边界。
+- 外部工具显式失败，模型输出还要经过 Java Validator。
+
+**一句话记忆：**
+
+> 会话与工具双隔离，工具结果与模型引用双校验。
+
 **只读本文能否直接讲已上线项目？**本文足以学习 V2 的目标业务链路和设计取舍，但不能把设计稿当成个人实现证据。面试前应独立准备下面的脱敏证据；缺哪项就坦白说它仍是 V2 扩展方案，不用推测补齐。
 
 | 追问方向 | 应准备的本人项目证据 |
