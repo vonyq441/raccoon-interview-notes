@@ -40,13 +40,13 @@ Java 更新步骤和任务进度
 
 | 简历内容 | 对应章节 | 掌握等级 |
 |---|---|---|
-| Spring Boot 多机器人中央调度平台 | 第一部分 | 必须 |
-| 中央规划 Agent、结构化输出、工具调用 | 第二部分 | 必须 |
-| 状态跟踪、命令去重、超时重试、人工接管 | 第 3～4 章 | 必须 |
-| G1 动作编排与执行 | 第三部分 | 必须 |
-| QA Agent、RAG、工具调用、多轮上下文 | 第四部分 | 重点 |
-| 意图识别、自然语言机器人控制 | 第五部分 | 理解 |
-| 展台候补、认证、安全、部署 | 第六部分与附录 | 了解 |
+| Spring Boot 多机器人中央调度平台 | 阶段 1 | 必须 |
+| 中央规划 Agent、结构化输出、工具调用 | 阶段 2 | 必须 |
+| 状态跟踪、命令去重、超时、人工接管 | 阶段 3 | 必须 |
+| G1 动作编排与执行 | 阶段 4 | 必须 |
+| QA Agent、RAG、工具调用、多轮上下文 | 阶段 5 | 重点 |
+| 意图识别、自然语言机器人控制 | 阶段 6 | 理解 |
+| 展台候补、认证、安全、部署 | 外围能力与附录 | 了解 |
 
 ### 0.3 四级学习优先级
 
@@ -66,14 +66,43 @@ Java 更新步骤和任务进度
 
 **第四优先级：第一次可跳过**
 
-- 第六部分的扩展调度；
+- “外围能力和扩展”中的候补与高级调度；
 - 附录中的认证、设备安全、部署、完整表结构和完整状态机。
+
+### 0.4 六阶段学习路线
+
+这六个阶段既是阅读顺序，也是面试介绍项目时的展开顺序：
+
+```text
+阶段 1：中央调度基础平台
+Robot / Task / Plan / Step / Command / Event
+→ 完整 Task 执行链
+
+阶段 2：Planning Agent
+ChatClient / PlanEvidence / Tool Calling / PlanDraft
+→ Validator / Reviser / 人工审核 / 原子分配
+
+阶段 3：任务可靠执行
+commandId / 幂等 / 超时 UNKNOWN / Event / 人工接管
+
+阶段 4：G1
+G1ControlServer / RobotController / SDK Worker
+→ snapshot / motion / script / 互斥 / cancel
+
+阶段 5：QA Agent
+ChatClient / 请求级 QaTools / ChatMemory / RAG / Evidence
+
+阶段 6：Intent + Robot Control Agent
+规则路由 / 意图分类 / 受控技能选择 / Java 安全门禁
+```
+
+阶段 1 先建立业务骨架；阶段 2 学会怎样生成计划；阶段 3 再解决计划如何可靠执行。这样不会在还没理解 Task 和 Plan 时，就被幂等、超时等异常分支打断。
 
 面试时先讲能用代码、测试或验收材料证明的内容，再用“如果继续深化，我的 V2 设计是……”引出增强项。本文的“目标”“建议”“V2”均表示设计方案。
 
 ---
 
-# 第一部分：中央调度基础平台 ⭐⭐⭐
+# 阶段 1：中央调度基础平台 ⭐⭐⭐
 
 ## 1. 项目到底解决什么问题
 
@@ -146,41 +175,15 @@ public void handleRobotEvent(RobotEvent event) {
 
 数据库锁只保护短事务，不在网络请求期间持有。先提交 Command，再调用机器人，响应或异步 Event 用新事务更新。
 
-## 4. 命令可靠性：幂等、超时与人工接管
+# 阶段 2：Planning Agent ⭐⭐⭐
 
-Java 给每条命令唯一 commandId。机器人收到相同 commandId 时，不再次执行，而是返回保存的状态或结果。
-
-```text
-Java 发 C100 → 网络超时 → 不知道是否执行
-Java 重发 C100 → 机器人查到 C100 已接收 → 不重复移动/挥手
-```
-
-只比较命令类型不够，因为连续两次合法挥手必须允许。机器人应保存 commandId、payloadHash 和结果：同 ID 同参数返回历史结果，同 ID 不同参数拒绝。
-
-创建 RobotCommand 与 Outbox 待发送记录放在同一事务；后台发送器轮询 Outbox。Java 即使在提交后、发送前重启，命令仍可恢复发送，当前规模无需引入消息队列。
-
-请求超时先进入 UNKNOWN，因为“没收到结果”不等于“没执行”：
-
-1. 按 commandId 查询机器人侧状态；
-2. 仅对明确幂等、业务允许的命令重发原 ID；
-3. 仍不确定则暂停 Step 并人工接管；
-4. 不能换新 ID 盲目重试移动或动作。
-
-接管时 Task 进入 PAUSED_MANUAL，Java 停止产生新命令并请求机器人停止/取消。进程退出和网络断开都不能证明机器人已安全停止，必须等待设备状态或现场确认。
-
-> **本章必须会**：解释 commandId 去重、同 ID 参数校验、UNKNOWN，以及哪些错误不能自动重试。
-
----
-
-# 第二部分：中央规划 Agent ⭐⭐⭐
-
-## 5. 为什么需要中央规划 Agent
+## 4. 为什么需要中央规划 Agent
 
 用户可能说：“带一批学生参观，希望多看 AI 互动项目，必须经过 A03，最好少走回头路。”
 
 Java 擅长在线、空闲、区域、能力、展台开放、mustVisit、avoid、maxStops 等硬事实；LLM 擅长理解“学生”“互动”“AI 主题”“少走回头路”等软偏好。边界是：**Java 管硬约束，模型处理语义偏好，Java 再验证结果。**
 
-## 6. Planning Agent 总流程
+## 5. Planning Agent 总流程
 
 ```text
 规划请求
@@ -207,7 +210,7 @@ Java 格式校验 + 业务 Validator
 
 规划期间不锁机器人。草案是建议，真正占用发生在人工批准并点击下发时。
 
-## 7. PlanEvidence：模型允许使用的事实
+## 6. PlanEvidence：模型允许使用的事实
 
 ```java
 public record PlanEvidence(
@@ -227,7 +230,7 @@ public record RobotCandidate(
 
 Java 先过滤 ONLINE + IDLE + 区域允许 + 能力满足，只把合法候选交给模型。Planning Agent 不自己查数据库判断机器人状态：这是强一致事实，Java 直接查询更快、更稳定，也不会让模型漏查。
 
-## 8. Planning Tool 只补充语义资料
+## 7. Planning Tool 只补充语义资料
 
 工具可查询展台主题、适合人群、互动特征和业务背景，不能判断机器人在线、空闲或占用。
 
@@ -240,7 +243,7 @@ public PlanningSnippetResult searchPlanningKnowledge(String query) {
 
 工具返回 snippetId。模型若引用知识片段，PlanDraft 必须回传对应 ID，Java 才能检查来源。
 
-## 9. PlanDraft 与结构化输出
+## 8. PlanDraft 与结构化输出
 
 ```json
 {
@@ -264,7 +267,7 @@ public record PlanDraft(
 
 JSON 是传输文本，DTO 是 Java 接收对象，Schema 描述字段和类型，Bean Validation 检查必填与基本结构。优先使用模型或框架的结构化输出约束，再严格解析；可清理外围 Markdown 围栏，但不能用“删逗号、猜字段”悄悄修业务内容。
 
-## 10. Java Validator：能解析不等于能执行
+## 9. Java Validator：能解析不等于能执行
 
 ```json
 {"suggestedRobotId":"R9","orderedExhibitCodes":["A","B","B"]}
@@ -300,7 +303,7 @@ public List<PlanViolation> validate(
 }
 ```
 
-## 11. Planner → Validator → Reviser
+## 10. Planner → Validator → Reviser
 
 ```text
 Planner：A → B → B → C
@@ -325,7 +328,7 @@ return draftRepository.saveNeedsHumanReview(request, violations);
 
 它可称“有限反思式修订”，但不是自由运行的 Reflection Agent：反馈来自确定性 Java Validator，次数有上限，输出不能越过人工审核。
 
-## 12. 下发前再次检查并原子分配
+## 11. 下发前再次检查并原子分配
 
 草案生成后 R2 可能已被占用。点击下发时 Java 重新查询，并在事务中条件更新：
 
@@ -344,7 +347,37 @@ WHERE robot_id = :robotId
 
 ---
 
-# 第三部分：G1 动作编排与执行 ⭐⭐⭐
+# 阶段 3：任务可靠执行 ⭐⭐⭐
+
+## 12. commandId、幂等、超时与人工接管
+
+Java 给每条命令唯一 commandId。机器人收到相同 commandId 时，不再次执行，而是返回保存的状态或结果。
+
+```text
+Java 发 C100 → 网络超时 → 不知道是否执行
+Java 重发 C100 → 机器人查到 C100 已接收 → 不重复移动/挥手
+```
+
+只比较命令类型不够，因为连续两次合法挥手必须允许。机器人应保存 commandId、payloadHash 和结果：同 ID 同参数返回历史结果，同 ID 不同参数拒绝。
+
+创建 RobotCommand 与 Outbox 待发送记录放在同一事务；后台发送器轮询 Outbox。Java 即使在提交后、发送前重启，命令仍可恢复发送，当前规模无需引入消息队列。
+
+请求超时先进入 UNKNOWN，因为“没收到结果”不等于“没执行”：
+
+1. 按 commandId 查询机器人侧状态；
+2. 仅对明确幂等、业务允许的命令重发原 ID；
+3. 仍不确定则暂停 Step 并人工接管；
+4. 不能换新 ID 盲目重试移动或动作。
+
+Event 仍由第 3 章的事件处理器落库和推进状态；阶段 3 重点是在重复、超时、乱序和结果未知时仍能守住这条执行链。
+
+接管时 Task 进入 PAUSED_MANUAL，Java 停止产生新命令并请求机器人停止/取消。进程退出和网络断开都不能证明机器人已安全停止，必须等待设备状态或现场确认。
+
+> **本章必须会**：解释 commandId 去重、同 ID 参数校验、UNKNOWN、Event 去重，以及哪些错误不能自动重试。
+
+---
+
+# 阶段 4：G1 动作编排与执行 ⭐⭐⭐
 
 ## 13. G1 控制调用链
 
@@ -418,7 +451,7 @@ cancel 终止当前目标；stop 还要立即发安全停止。蹲下状态下�
 
 ---
 
-# 第四部分：知识问答 Agent ⭐⭐
+# 阶段 5：知识问答 Agent ⭐⭐
 
 ## 17. KnowledgeQaAgent 总流程
 
@@ -509,7 +542,7 @@ conversationId 隔离语义，请求级 QaTools 隔离业务数据访问。
 
 ---
 
-# 第五部分：意图识别与 Robot Control Agent ⭐
+# 阶段 6：Intent 与 Robot Control Agent ⭐
 
 ## 21. 规则优先，复杂语义再分类
 
@@ -545,7 +578,7 @@ ROBOT_CONTROL / KNOWLEDGE_QA / CENTRAL_PLANNING / OTHER
 
 ---
 
-# 第六部分：外围能力和扩展（第一次可跳过）
+# 外围能力和扩展（第一次可跳过）
 
 ## 23. 展台容量、候补与等待体验
 
@@ -584,7 +617,7 @@ R2 请求去 B
 
 ---
 
-# 第七部分：大厂校招面试题
+# 大厂校招面试题
 
 ## 25. 基础平台
 
@@ -718,7 +751,7 @@ R2 请求去 B
 
 ---
 
-# 第八部分：附录
+# 附录
 
 ## 附录 A：认证与权限
 
@@ -817,7 +850,7 @@ RESERVED → EXPIRED；OCCUPIED → UNKNOWN
 
 ## 附录 F：实现顺序与源码核对入口
 
-建议顺序：核心实体与审核 → 命令/事件闭环 → Planning Agent → G1 真机接入 → QA Agent → 意图识别与 Robot Control Agent → 外围能力。
+建议顺序：基础实体与 Task 闭环 → Planning Agent → 命令可靠执行 → G1 真机接入 → QA Agent → Intent 与 Robot Control Agent → 外围能力。
 
 已有机器人代码核对入口：
 
