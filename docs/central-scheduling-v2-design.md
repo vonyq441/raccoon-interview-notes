@@ -4,107 +4,70 @@
 >
 > **项目边界**：2 台机器人、单展厅、模块化单体、PostgreSQL、Spring Boot、Spring AI。bot_mind 与 g1_base 是已有机器人侧代码；本文重点设计 Java 中央平台和智能体，并解释它们如何接入机器人。
 
-## 0. 先看这里：这份文档应该怎么学
+## 0. 阅读指南
 
-### 0.1 一句话介绍与最简主线
+### 0.1 项目一句话介绍
 
-接待员创建参观任务，中央规划 Agent 建议机器人和路线，工作人员审核后由 Java 平台逐步下发导航、讲解和动作命令，再根据机器人事件推进任务，形成可查询、可重试、可人工接管的闭环。
+接待员创建参观任务，中央规划 Agent 建议机器人和路线，工作人员审核后由 Java 平台逐步下发导航、讲解和动作命令，再根据机器人事件推进任务，形成可查询、可重试、可人工接管的多机器人接待闭环。
 
-```text
-创建接待任务
-    ↓
-中央规划 Agent → PlanDraft → Java Validator
-    ↓
-人工审核
-    ↓
-分配 Robot，生成 Plan / PlanStep
-    ↓
-下发 RobotCommand
-    ↓
-bot_mind / G1ControlServer
-    ↓
-导航 / 讲解 / 动作
-    ↓
-RobotEvent
-    ↓
-Java 更新步骤和任务进度
-```
+系统边界可以先记成三句话：
 
-先记住三个边界：
-
-1. **模型提出建议**，不直接改任务状态，也不直接控制硬件。
+1. **模型提出建议**，不直接改变任务状态，也不直接控制硬件。
 2. **Java 保存事实并作决定**，负责校验、事务、权限、幂等和状态推进。
 3. **机器人执行并回报结果**，路径规划和硬件安全留在机器人侧。
 
-### 0.2 简历与章节映射
+### 0.2 简历职责映射
 
-| 简历内容 | 对应章节 | 掌握等级 |
+| 简历内容 | 对应部分 | 掌握要求 |
 |---|---|---|
-| Spring Boot 多机器人中央调度平台 | 阶段 1 | 必须 |
-| 中央规划 Agent、结构化输出、工具调用 | 阶段 2 | 必须 |
-| 状态跟踪、命令去重、超时、人工接管 | 阶段 3 | 必须 |
-| G1 动作编排与执行 | 阶段 4 | 必须 |
-| QA Agent、RAG、工具调用、多轮上下文 | 阶段 5 | 重点 |
-| 意图识别、自然语言机器人控制 | 阶段 6 | 理解 |
-| 展台候补、认证、安全、部署 | 外围能力与附录 | 了解 |
+| Spring Boot 多机器人中央调度平台 | 第一部分 | 能完整讲出 Task 执行链 |
+| 状态跟踪、命令去重、超时重试、人工接管 | 第一部分 | 能解释异常恢复 |
+| 中央规划 Agent、结构化输出、工具调用 | 第二部分 | 能画出规划与校验链 |
+| G1 动作编排与执行 | 第三部分 | 能说明机器人实际如何执行 |
+| QA Agent、RAG、工具调用、多轮上下文 | 第四部分 | 能说明 Spring AI 编排边界 |
+| 意图识别、自然语言机器人控制 | 第四部分 | 理解路由、技能选择和安全门禁 |
+| 认证、安全、部署与扩展调度 | 附录 | 面试追问时查阅 |
 
-### 0.3 四级学习优先级
+### 0.3 推荐学习顺序
 
-**第一优先级 ⭐⭐⭐**
+建议按下面顺序阅读，而不是按技术名词逐个背诵：
 
-- 中央调度基础平台：Robot / Task / Plan / PlanStep / RobotCommand / RobotEvent。
-- 中央规划 Agent：PlanEvidence → PlanDraft → Validator → Reviser → 人工审核。
-- G1 动作模块：Java → bot_mind → G1ControlServer → Python Worker → Unitree SDK。
+~~~text
+中央调度平台基础
+→ 中央规划 Agent
+→ 命令可靠执行
+→ G1 机器人执行
+→ QA Agent
+→ Intent / Robot Control Agent
+~~~
 
-**第二优先级 ⭐⭐**
+第一次阅读先完成第一至第四部分的业务主线，再看第五部分面试题。认证、设备安全、部署、完整数据库和高级扩展放到第二遍查阅。
 
-- 知识问答 Agent：请求级工具、RAG、ChatMemory、证据校验和隔离。
+### 0.4 项目完整主流程
 
-**第三优先级 ⭐**
+~~~text
+创建 Task
+→ Planning Agent
+→ PlanDraft
+→ Java Validator
+→ 人工审核
+→ Plan / PlanStep
+→ RobotCommand
+→ bot_mind / G1ControlServer 执行
+→ RobotEvent
+→ Java 推进下一 Step
+→ Task COMPLETED
+~~~
 
-- 意图识别 ChatClient 和 Robot Control Agent，第一遍理解职责与调用链即可。
-
-**第四优先级：第一次可跳过**
-
-- “外围能力和扩展”中的候补与高级调度；
-- 附录中的认证、设备安全、部署、完整表结构和完整状态机。
-
-### 0.4 六阶段学习路线
-
-这六个阶段既是阅读顺序，也是面试介绍项目时的展开顺序：
-
-```text
-阶段 1：中央调度基础平台
-Robot / Task / Plan / Step / Command / Event
-→ 完整 Task 执行链
-
-阶段 2：Planning Agent
-ChatClient / PlanEvidence / Tool Calling / PlanDraft
-→ Validator / Reviser / 人工审核 / 原子分配
-
-阶段 3：任务可靠执行
-commandId / 幂等 / 超时 UNKNOWN / Event / 人工接管
-
-阶段 4：G1
-G1ControlServer / RobotController / SDK Worker
-→ snapshot / motion / script / 互斥 / cancel
-
-阶段 5：QA Agent
-ChatClient / 请求级 QaTools / ChatMemory / RAG / Evidence
-
-阶段 6：Intent + Robot Control Agent
-规则路由 / 意图分类 / 受控技能选择 / Java 安全门禁
-```
-
-阶段 1 先建立业务骨架；阶段 2 学会怎样生成计划；阶段 3 再解决计划如何可靠执行。这样不会在还没理解 Task 和 Plan 时，就被幂等、超时等异常分支打断。
-
-面试时先讲能用代码、测试或验收材料证明的内容，再用“如果继续深化，我的 V2 设计是……”引出增强项。本文的“目标”“建议”“V2”均表示设计方案。
+当前项目边界是 2 台机器人、单展厅、Spring Boot 模块化单体、PostgreSQL 和 Spring AI。bot_mind 与 g1_base 是已有机器人侧代码；本文重点说明 Java 中央平台和智能体如何组织并接入机器人。文中的“目标”“建议”“V2”表示深化设计，不能自动等同于原项目已上线能力。
 
 ---
 
-# 阶段 1：中央调度基础平台 ⭐⭐⭐
+# 第一部分：中央调度平台基础 ⭐⭐⭐
 
-## 1. 项目到底解决什么问题
+> **这一部分要掌握什么**：六个核心业务对象、一次 Task 的完整执行链，以及重复、超时、乱序和人工接管时系统怎样保持一致。
+
+## 1.1 系统解决什么问题
 
 ```text
 接待员创建参观任务
@@ -118,7 +81,7 @@ ChatClient / 请求级 QaTools / ChatMemory / RAG / Evidence
 
 平台处理的是业务协调，不是 Nav2 如何避障。当前规模采用 Spring Boot 模块化单体，数据统一落 PostgreSQL，无需微服务、消息队列或分布式锁。
 
-## 2. 最小业务模型
+## 1.2 核心业务模型
 
 | 对象 | 一句话解释 | 典型字段 |
 |---|---|---|
@@ -130,18 +93,18 @@ ChatClient / 请求级 QaTools / ChatMemory / RAG / Evidence
 | RobotEvent | 机器人回传的执行事实 | eventId, commandId, type, occurredAt |
 
 ```text
-Robot 1 ─ n Task
+Robot 1 ─ n Task（历史上可以执行多个 Task）
+同一时刻，一个 Robot 最多执行一个活动 Task
 Task  1 ─ 1 Plan
 Plan  1 ─ n PlanStep
 PlanStep 1 ─ n RobotCommand
 RobotCommand 1 ─ n RobotEvent
 ```
 
-Step 和 Command 不能合并：Step 表达业务目标，一次“导航到 A03”可能因可重试错误产生两条 Command；Step 仍是同一个目标。
+这组关系表达的是历史记录，不表示机器人可以同时执行多个活动任务。
 
-> **本章必须会**：解释六个对象，并说清 Step 是目标、Command 是调用、Event 是事实。
 
-## 3. 一个 Task 是怎么执行的
+## 1.3 一个 Task 从创建到完成
 
 ```text
 Task CREATED → 生成 PlanDraft → 人工审核 → Plan APPROVED
@@ -154,6 +117,18 @@ Task CREATED → 生成 PlanDraft → 人工审核 → Plan APPROVED
 - 工作人员审核计划、确认下发、人工接管。
 - Java 是业务事实中心，根据状态机改变 Task、Step、Command。
 - 机器人回传 COMMAND_STARTED、NAVIGATION_SUCCEEDED 等事实事件。
+
+## 1.4 命令与事件为什么要分开
+
+可以把三者理解为：
+
+~~~text
+Step    = 业务目标
+Command = 一次设备调用
+Event   = 执行事实
+~~~
+
+Step 和 Command 不能合并：Step 表达业务目标，一次“导航到 A03”可能因可重试错误产生两条 Command；Step 仍是同一个目标。
 
 **Event 是输入事实，Java 状态机是裁判。** Java 要检查 eventId、commandId、机器人身份和当前状态，不能让重复或延迟事件推进错误任务。
 
@@ -175,15 +150,56 @@ public void handleRobotEvent(RobotEvent event) {
 
 数据库锁只保护短事务，不在网络请求期间持有。先提交 Command，再调用机器人，响应或异步 Event 用新事务更新。
 
-# 阶段 2：Planning Agent ⭐⭐⭐
+## 1.5 命令可靠执行
 
-## 4. 为什么需要中央规划 Agent
+Java 给每条命令唯一 commandId。机器人收到相同 commandId 时，不再次执行，而是返回保存的状态或结果。
+
+```text
+Java 发 C100 → 网络超时 → 不知道是否执行
+Java 重发 C100 → 机器人查到 C100 已接收 → 不重复移动/挥手
+```
+
+只比较命令类型不够，因为连续两次合法挥手必须允许。机器人应保存 commandId、payloadHash 和结果：同 ID 同参数返回历史结果，同 ID 不同参数拒绝。
+
+创建 RobotCommand 与 Outbox 待发送记录放在同一事务；后台发送器轮询 Outbox。Java 即使在提交后、发送前重启，命令仍可恢复发送，当前规模无需引入消息队列。
+
+请求超时先进入 UNKNOWN，因为“没收到结果”不等于“没执行”：
+
+1. 按 commandId 查询机器人侧状态；
+2. 仅对明确幂等、业务允许的命令重发原 ID；
+3. 仍不确定则暂停 Step 并人工接管；
+4. 不能换新 ID 盲目重试移动或动作。
+
+Event 仍由 1.4 节的事件处理器落库和推进状态；本节重点是在重复、超时、乱序和结果未知时仍能守住这条执行链。
+
+接管时 Task 进入 PAUSED_MANUAL，Java 停止产生新命令并请求机器人停止/取消。进程退出和网络断开都不能证明机器人已安全停止，必须等待设备状态或现场确认。
+
+## 1.6 本部分小结
+
+~~~text
+Task              管一次完整业务目标
+Plan / PlanStep   管审核后的执行顺序
+RobotCommand      管一次设备调用
+RobotEvent        管机器人回传的执行事实
+commandId         保证同一次命令不重复执行
+UNKNOWN           表示结果暂时无法确认
+~~~
+
+Java 是任务事实中心；机器人负责执行并回报。正常链路和异常恢复使用同一组 Command、Event 与状态机，而不是两套互不相干的流程。
+
+---
+
+# 第二部分：中央规划 Agent ⭐⭐⭐
+
+> **这一部分要掌握什么**：Java 与 LLM 的职责边界、结构化计划怎样校验和修订，以及为什么规划不锁资源而下发必须原子分配。
+
+## 2.1 为什么需要 Planning Agent
 
 用户可能说：“带一批学生参观，希望多看 AI 互动项目，必须经过 A03，最好少走回头路。”
 
 Java 擅长在线、空闲、区域、能力、展台开放、mustVisit、avoid、maxStops 等硬事实；LLM 擅长理解“学生”“互动”“AI 主题”“少走回头路”等软偏好。边界是：**Java 管硬约束，模型处理语义偏好，Java 再验证结果。**
 
-## 5. Planning Agent 总流程
+## 2.2 Planning Agent 总流程
 
 ```text
 规划请求
@@ -210,7 +226,7 @@ Java 格式校验 + 业务 Validator
 
 规划期间不锁机器人。草案是建议，真正占用发生在人工批准并点击下发时。
 
-## 6. PlanEvidence：模型允许使用的事实
+## 2.3 PlanEvidence：模型允许使用的事实
 
 ```java
 public record PlanEvidence(
@@ -230,7 +246,7 @@ public record RobotCandidate(
 
 Java 先过滤 ONLINE + IDLE + 区域允许 + 能力满足，只把合法候选交给模型。Planning Agent 不自己查数据库判断机器人状态：这是强一致事实，Java 直接查询更快、更稳定，也不会让模型漏查。
 
-## 7. Planning Tool 只补充语义资料
+## 2.4 Planning Tool：只补充语义信息
 
 工具可查询展台主题、适合人群、互动特征和业务背景，不能判断机器人在线、空闲或占用。
 
@@ -243,7 +259,7 @@ public PlanningSnippetResult searchPlanningKnowledge(String query) {
 
 工具返回 snippetId。模型若引用知识片段，PlanDraft 必须回传对应 ID，Java 才能检查来源。
 
-## 8. PlanDraft 与结构化输出
+## 2.5 PlanDraft 与结构化输出
 
 ```json
 {
@@ -265,9 +281,9 @@ public record PlanDraft(
 ) {}
 ```
 
-JSON 是传输文本，DTO 是 Java 接收对象，Schema 描述字段和类型，Bean Validation 检查必填与基本结构。优先使用模型或框架的结构化输出约束，再严格解析；可清理外围 Markdown 围栏，但不能用“删逗号、猜字段”悄悄修业务内容。
+JSON 是传输文本，DTO 是 Java 接收对象，Schema 描述字段和类型，Bean Validation 检查必填与基本结构。Schema 和 Bean Validation 解决“格式能不能读”，后面的业务 Validator 解决“内容能不能用”。优先使用模型或框架的结构化输出约束，再严格解析；可清理外围 Markdown 围栏，但不能用“删逗号、猜字段”悄悄修业务内容。
 
-## 9. Java Validator：能解析不等于能执行
+## 2.6 Java Validator：保证内容能用
 
 ```json
 {"suggestedRobotId":"R9","orderedExhibitCodes":["A","B","B"]}
@@ -303,7 +319,7 @@ public List<PlanViolation> validate(
 }
 ```
 
-## 10. Planner → Validator → Reviser
+## 2.7 Reviser 与有限尝试
 
 ```text
 Planner：A → B → B → C
@@ -324,11 +340,11 @@ for (int attempt = 1; attempt <= 3; attempt++) {
 return draftRepository.saveNeedsHumanReview(request, violations);
 ```
 
-最多 3 次模型尝试：一次 Planner，加至多两次 Reviser。首次合法立即结束；候选为空、mustVisit 与 avoid 冲突等明确无解情况直接人工处理。
+调用顺序是 Attempt 1 使用 Planner，Attempt 2 和 Attempt 3 才是 Reviser；最多 3 次模型尝试。首次合法立即结束；候选为空、mustVisit 与 avoid 冲突等明确无解情况直接人工处理。
 
 它可称“有限反思式修订”，但不是自由运行的 Reflection Agent：反馈来自确定性 Java Validator，次数有上限，输出不能越过人工审核。
 
-## 11. 下发前再次检查并原子分配
+## 2.8 人工审核、下发前校验与原子占用
 
 草案生成后 R2 可能已被占用。点击下发时 Java 重新查询，并在事务中条件更新：
 
@@ -343,43 +359,28 @@ WHERE robot_id = :robotId
 
 影响 1 行才成功；0 行返回 ASSIGN_CONFLICT，重新规划或人工处理。不能静默换机器人，因为人工审核的是“机器人 + 路线”的整体。
 
-> **本章必须会**：白板画出 PlanEvidence → PlanDraft → Validator → 至多两次 Reviser → 人工审核 → 最新状态校验 → 原子分配。
+## 2.9 本部分小结
+
+~~~text
+PlanEvidence
+→ Planner
+→ PlanDraft
+→ Validator
+→ 必要时 Reviser
+→ 人工审核
+→ 下发前校验
+→ 原子分配
+~~~
+
+**LLM 负责提出计划，Java 负责保证计划合法并决定是否执行。**
 
 ---
 
-# 阶段 3：任务可靠执行 ⭐⭐⭐
+# 第三部分：G1 机器人执行系统 ⭐⭐⭐
 
-## 12. commandId、幂等、超时与人工接管
+> **这一部分要掌握什么**：业务命令如何下沉到机器人、Python Worker 为什么存在、三层动作体系怎样复用，以及多个控制源如何安全协作。
 
-Java 给每条命令唯一 commandId。机器人收到相同 commandId 时，不再次执行，而是返回保存的状态或结果。
-
-```text
-Java 发 C100 → 网络超时 → 不知道是否执行
-Java 重发 C100 → 机器人查到 C100 已接收 → 不重复移动/挥手
-```
-
-只比较命令类型不够，因为连续两次合法挥手必须允许。机器人应保存 commandId、payloadHash 和结果：同 ID 同参数返回历史结果，同 ID 不同参数拒绝。
-
-创建 RobotCommand 与 Outbox 待发送记录放在同一事务；后台发送器轮询 Outbox。Java 即使在提交后、发送前重启，命令仍可恢复发送，当前规模无需引入消息队列。
-
-请求超时先进入 UNKNOWN，因为“没收到结果”不等于“没执行”：
-
-1. 按 commandId 查询机器人侧状态；
-2. 仅对明确幂等、业务允许的命令重发原 ID；
-3. 仍不确定则暂停 Step 并人工接管；
-4. 不能换新 ID 盲目重试移动或动作。
-
-Event 仍由第 3 章的事件处理器落库和推进状态；阶段 3 重点是在重复、超时、乱序和结果未知时仍能守住这条执行链。
-
-接管时 Task 进入 PAUSED_MANUAL，Java 停止产生新命令并请求机器人停止/取消。进程退出和网络断开都不能证明机器人已安全停止，必须等待设备状态或现场确认。
-
-> **本章必须会**：解释 commandId 去重、同 ID 参数校验、UNKNOWN、Event 去重，以及哪些错误不能自动重试。
-
----
-
-# 阶段 4：G1 动作编排与执行 ⭐⭐⭐
-
-## 13. G1 控制调用链
+## 3.1 从 Java 到机器人的完整调用链
 
 ```text
 Java 中央平台
@@ -395,6 +396,10 @@ RobotController
                           Unitree SDK
 ```
 
+## 3.2 G1ControlServer 与 RobotController
+
+G1ControlServer 统一承接需要持续反馈的导航 Action、短时控制 Service 和运行状态发布；RobotController 再把这些上层调用收敛到导航、底盘、手臂和安全状态。正文不枚举所有接口，只保留职责边界：
+
 - Java 决定业务步骤并持久化命令；
 - bot_mind 承接机器人本机语音、讲解与技能；
 - G1ControlServer 是 ROS2 控制入口，提供导航 Action、动作/移动/停止 Service 并发布状态；
@@ -403,7 +408,7 @@ RobotController
 
 Robot Control Agent 是 Java 的自然语言技能选择层；本章是实际执行层。前者提出“调哪个技能及参数”，后者保证真正、安全、可取消地执行。
 
-## 14. 为什么使用独立 Python Worker
+## 3.3 为什么使用独立 Python Worker
 
 现有 UnitreeSdkBridge 启动 Python 子进程，通过 stdin/stdout 逐行 JSON：
 
@@ -416,7 +421,7 @@ Robot Control Agent 是 Java 的自然语言技能选择层；本章是实际执
 
 目标实现还要补充请求超时、取消和 Worker 健康检查。杀掉 Worker 只表示进程结束，不能证明机器人停稳。
 
-## 15. snapshot / motion / script
+## 3.4 snapshot / motion / script
 
 - **snapshot**：单个关键姿态，如抬右手、指向左侧、恢复；从当前姿态平滑插值过去。
 - **motion**：多帧带时间的连续轨迹，如完整挥手。
@@ -426,9 +431,17 @@ Robot Control Agent 是 Java 的自然语言技能选择层；本章是实际执
 script：向前一步 → 播报欢迎语 → wave motion → 等待 1 秒 → 转身
 ```
 
+~~~text
+snapshot（关键姿态）
+    ↓ 组成
+motion（连续轨迹）
+    ↓ 参与编排
+script（完整表演流程）
+~~~
+
 三层让关键姿态可组成不同动作，动作又可复用到多段讲解脚本；关节数据与业务流程也能分别维护。
 
-## 16. 动作互斥和导航协同
+## 3.5 导航、动作和控制互斥
 
 | 控制源 | 示例 | 基本规则 |
 |---|---|---|
@@ -447,13 +460,17 @@ script：向前一步 → 播报欢迎语 → wave motion → 等待 1 秒 → �
 
 cancel 终止当前目标；stop 还要立即发安全停止。蹲下状态下移动或导航应被 squat guard 拒绝。Java 不能绕过本机安全拒绝强行重发。
 
-> **本章必须会**：解释五层调用链、Worker 隔离、三层动作模型，以及导航和动作为什么互斥。
+## 3.6 本部分小结
+
+Java 与 bot_mind 处理业务命令，G1ControlServer 与 RobotController 统一机器人本机控制，UnitreeSdkBridge/Worker 隔离 SDK。snapshot、motion、script 解决动作素材复用；navigation、manual、script 的互斥、取消和状态同步守住执行安全。
 
 ---
 
-# 阶段 5：知识问答 Agent ⭐⭐
+# 第四部分：Spring AI 智能体能力 ⭐⭐
 
-## 17. KnowledgeQaAgent 总流程
+> **这一部分要掌握什么**：ChatClient 如何组织模型和工具、QA 的上下文与数据访问如何隔离，以及意图分类、技能选择、实际机器人执行为何分层。
+
+## 4.1 知识问答 Agent 总流程
 
 ```text
 用户提问
@@ -471,9 +488,11 @@ Java 收集真实 Evidence
 Java 校验证据引用后播报
 ```
 
+## 4.2 ChatClient、ChatModel 与 Tool Calling
+
 ChatModel 是底层模型连接；ChatClient 是组合 Prompt、Tool、Advisor 和输出契约的调用入口。ChatClient 构建时确定模型，不在每次请求里随意切换。
 
-## 18. 请求级 QaTools
+## 4.3 请求级 QaTools
 
 KnowledgeQaAgent、ChatClient、RagService、WeatherService、WebSearchService 是共享对象；QaTools 每轮创建并绑定 robotId、taskId、stepId、exhibitCode、knowledgeVersion。
 
@@ -496,7 +515,7 @@ public RagEvidence searchExhibitKnowledge(String query) {
 
 若让模型填写 exhibitCode，它可能越界。RAG 和工具调用是两个维度：RAG 是检索增强方法；这里将其封装为 Tool，让模型按需选择。天气和联网也是 Tool，但不是 RAG。
 
-## 19. ChatMemory 与会话边界
+## 4.4 ChatMemory 与上下文边界
 
 “这个设备是什么？”之后追问“它有什么特点？”，需要历史理解“它”。采用：
 
@@ -513,7 +532,7 @@ QaTools    → 当前允许查什么
 
 历史存 PostgreSQL，每轮只加载最近若干条或摘要。工具结果不长期原样混入记忆，避免旧天气和旧证据被复用。
 
-## 20. RAG、容错与可信回答
+## 4.5 RAG
 
 ```text
 已审核文档 → Chunk → Embedding → pgvector
@@ -522,6 +541,8 @@ QaTools    → 当前允许查什么
 ```
 
 先做元数据过滤，再做向量检索。切分大小、TopK 和阈值应通过真实问答集评估。
+
+## 4.6 Evidence 与工具容错
 
 - RAG 无结果：不回答展厅内部事实；
 - Weather 超时：明确实时天气不可用，不靠模型记忆补写；
@@ -538,13 +559,7 @@ if (!collector.evidenceIds().containsAll(answer.evidenceIds())) {
 
 conversationId 隔离语义，请求级 QaTools 隔离业务数据访问。
 
-> **本章必须会**：解释请求级工具、TaskStep 会话、RAG 过滤和 evidenceId 各解决什么问题。
-
----
-
-# 阶段 6：Intent 与 Robot Control Agent ⭐
-
-## 21. 规则优先，复杂语义再分类
+## 4.7 意图识别
 
 “停止”“下一站”等明确指令由 Java 规则直接处理；下一站仍需校验 Task、Robot 和目标展台。未命中规则的复杂文本才进入无工具、低温度、结构化输出的 Intent ChatClient：
 
@@ -554,7 +569,7 @@ ROBOT_CONTROL / KNOWLEDGE_QA / CENTRAL_PLANNING / OTHER
 
 分类失败或置信不足时澄清，不能猜测具有副作用的路由。
 
-## 22. Robot Control Agent
+## 4.8 Robot Control Agent
 
 “向前走一点，然后挥手”被映射为白名单技能：
 
@@ -576,50 +591,24 @@ ROBOT_CONTROL / KNOWLEDGE_QA / CENTRAL_PLANNING / OTHER
 
 模型不能拥有任意 URL、Shell 或 SDK 权限。Robot Control Agent 负责理解并提出技能调用；G1 模块负责实际执行和硬件安全。
 
----
+## 4.9 本部分小结
 
-# 外围能力和扩展（第一次可跳过）
+~~~text
+QA Agent：按问题选择 RAG / Weather / Web / 0 Tool
+Intent ChatClient：只分类，不调用工具
+Robot Control Agent：把自然语言映射为白名单技能
+G1 执行层：真正执行技能并保障硬件安全
+~~~
 
-## 23. 展台容量、候补与等待体验
-
-R1 正在 B 讲解，R2 下一站也是 B 时，R2 不能先过去。每个 Task 对目标展台只有一条 ExhibitAllocation：
-
-```text
-WAITING  候补，不占容量
-RESERVED 已预约，短时占容量
-OCCUPIED 已到达并占用
-RELEASED 已离开
-```
-
-同一记录以状态字段演进，不另建重复的候补表。
-
-```text
-R2 请求去 B
-→ Java 发现 R1 OCCUPIED
-→ R2 进入 WAITING，前端显示候补
-→ R2 留在 A 开放问答或播备用讲稿
-→ R1 完成当前问题并提示前往下一站
-→ R1 离开且清场确认
-→ 同一事务释放 R1、将首个候补改为 RESERVED
-→ R2 再校验预约和控制权后导航
-```
-
-默认冲突处理是 Java 状态机，不经过 Agent。只有要判断“换哪个展台更符合偏好”时才有限重规划。强制清场也不能绕过安全确认和工作人员策略。
-
-## 24. 后续扩展
-
-- 有限重规划：展台长期不可用时，用剩余 Step 和最新候选重新生成草案；
-- 巡检复用：复用 Task/Plan/Step/Command 主干，巡检指标另建模；
-- 跨楼层接力：增加换层点、能力和人工交接；
-- 动态 ETA：有真实导航和排队数据后再建模，不能由 Agent 猜。
-
-这些属于 P1/P2，不占用核心项目介绍时间。
+ChatMemory 管“之前聊过什么”，请求级 QaTools 管“当前允许查什么”；模型负责语义判断和工具选择，Java 负责范围、权限、参数、证据与副作用校验。
 
 ---
 
-# 大厂校招面试题
+# 第五部分：项目面试复习
 
-## 25. 基础平台
+> **这一部分要掌握什么**：用项目问题、设计取舍和异常处理组织回答，避免只背框架名或把 V2 目标设计说成全部已上线。
+
+## 5.1 中央调度平台高频问题
 
 ### Q1：为什么同时设计 Step、Command、Event？
 
@@ -629,25 +618,9 @@ R2 请求去 B
 
 **一句话记忆：** Step 是目标，Command 是调用，Event 是事实。
 
-### Q2：幂等是不是重复命令不再执行？
+## 5.2 Planning Agent 高频问题
 
-**推荐回答：** 对同一 commandId 是。机器人保存 payloadHash 和结果；同 ID 同参数返回历史结果，同 ID 不同参数拒绝。两次正常挥手使用不同 ID。
-
-**追问：** 超时重发用什么 ID？必须用原 ID。
-
-**一句话记忆：** 同一次不重做，不同次仍可执行。
-
-### Q3：为什么超时是 UNKNOWN？
-
-**推荐回答：** 平台没收到响应时，机器人可能已执行。先查询、必要时按原 ID 幂等重发，仍不确定就暂停并人工接管。
-
-**追问：** 哪些不能自动重试？参数非法、资源冲突、安全拒绝和非幂等副作用。
-
-**一句话记忆：** 没收到结果，不等于没有执行。
-
-## 26. Planning Agent
-
-### Q4：它为什么不是普通 Chatbot？
+### Q2：它为什么不是普通 Chatbot？
 
 **推荐回答：** 它接收 Java 准备的事实，按需查询规划知识，输出结构化可执行草案，经业务 Validator 后有限修订并进入人工审核。模型做语义规划，Java 掌握状态和执行权。
 
@@ -655,7 +628,7 @@ R2 请求去 B
 
 **一句话记忆：** Agent 规划，Java 决策和执行。
 
-### Q5：JSON 正确但内容错误怎么办？
+### Q3：JSON 正确但内容错误怎么办？
 
 **推荐回答：** Schema 和 Bean Validation 保证能解析，业务 Validator 再检查候选、重复、必到和禁入。错误反馈 Reviser，至多两次；无解或持续失败转人工。
 
@@ -663,7 +636,7 @@ R2 请求去 B
 
 **一句话记忆：** 结构校验保证能读，业务校验保证能用。
 
-### Q6：规划为什么不锁机器人？
+### Q4：规划为什么不锁机器人？
 
 **推荐回答：** 草案可能被拒绝，提前锁定会浪费资源。审核下发时重新查状态，再用条件更新原子完成 IDLE → ASSIGNED；冲突显式返回，不能静默换机器人。
 
@@ -671,7 +644,7 @@ R2 请求去 B
 
 **一句话记忆：** 规划是建议，下发才占资源。
 
-### Q7：修订算 Reflection Agent 吗？
+### Q5：修订算 Reflection Agent 吗？
 
 **推荐回答：** 广义是反思式修订，严格说不是独立开放的 Reflection Agent。反馈来自确定性 Validator，总共最多三次模型尝试，持续失败转人工。
 
@@ -679,9 +652,37 @@ R2 请求去 B
 
 **一句话记忆：** 有限校验反馈，不是无限自我反思。
 
-## 27. G1 动作模块
+## 5.3 可靠执行与并发问题
 
-### Q8：为什么 Unitree SDK 放独立 Worker？
+### Q6：幂等是不是重复命令不再执行？
+
+**推荐回答：** 对同一 commandId 是。机器人保存 payloadHash 和结果；同 ID 同参数返回历史结果，同 ID 不同参数拒绝。两次正常挥手使用不同 ID。
+
+**追问：** 超时重发用什么 ID？必须用原 ID。
+
+**一句话记忆：** 同一次不重做，不同次仍可执行。
+
+### Q7：为什么超时是 UNKNOWN？
+
+**推荐回答：** 平台没收到响应时，机器人可能已执行。先查询、必要时按原 ID 幂等重发，仍不确定就暂停并人工接管。
+
+**追问：** 哪些不能自动重试？参数非法、资源冲突、安全拒绝和非幂等副作用。
+
+**一句话记忆：** 没收到结果，不等于没有执行。
+
+### Q8：两台机器人为什么还做并发控制？
+
+**推荐回答：** 人少也可能同时下发或争抢同一展台。数据库条件更新、唯一约束和短事务足以守住不变量，不需要分布式锁。
+
+**追问：** 扩到十几台要重写吗？保留状态和约束，再按吞吐决定基础设施。
+
+**一句话记忆：** 用最小机制守住并发不变量。
+
+---
+
+## 5.4 G1 动作模块问题
+
+### Q9：为什么 Unitree SDK 放独立 Worker？
 
 **推荐回答：** 隔离 SDK 依赖、慢调用和崩溃。逐行 JSON 通信，requestId 对齐，锁保证串行，独立线程消费 stderr。
 
@@ -689,7 +690,7 @@ R2 请求去 B
 
 **一句话记忆：** Worker 隔离 SDK，安全停止仍需确认。
 
-### Q9：snapshot、motion、script 为什么三层？
+### Q10：snapshot、motion、script 为什么三层？
 
 **推荐回答：** snapshot 是关键姿态，motion 是连续轨迹，script 是动作、等待、播报的业务编排。分层便于素材复用并隔离关节数据与业务流程。
 
@@ -697,7 +698,7 @@ R2 请求去 B
 
 **一句话记忆：** 姿态组成动作，动作组成表演。
 
-### Q10：cancel 和 stop 有什么区别？
+### Q11：cancel 和 stop 有什么区别？
 
 **推荐回答：** cancel 结束当前目标；stop 还要立即发送安全停止。取消后需发布状态、释放控制权，Java 再决定跳过、重试或人工处理。
 
@@ -705,9 +706,9 @@ R2 请求去 B
 
 **一句话记忆：** cancel 管任务，stop 管安全停止。
 
-## 28. QA Agent
+## 5.5 QA Agent / RAG 问题
 
-### Q11：RAG 为什么做成 Tool？
+### Q12：RAG 为什么做成 Tool？
 
 **推荐回答：** 展台问题需要 RAG，天气需要天气工具，寒暄不需要。模型决定是否查，Java 绑定展台和知识版本，控制能查什么。
 
@@ -715,7 +716,7 @@ R2 请求去 B
 
 **一句话记忆：** 模型决定是否查，Java 决定能查什么。
 
-### Q12：ChatMemory 和 QaTools 有什么区别？
+### Q13：ChatMemory 和 QaTools 有什么区别？
 
 **推荐回答：** ChatMemory 保存同一 TaskStep 对话，理解“它”；请求级 QaTools 绑定本轮机器人、任务、展台和知识版本，限制数据访问。
 
@@ -723,7 +724,7 @@ R2 请求去 B
 
 **一句话记忆：** Memory 管聊过什么，Tools 管允许查什么。
 
-### Q13：如何防止伪造知识来源？
+### Q14：如何防止伪造知识来源？
 
 **推荐回答：** Java 记录本轮工具真实 evidenceId，模型结构化返回引用，播报前做集合校验；无证据不回答内部事实。
 
@@ -731,9 +732,9 @@ R2 请求去 B
 
 **一句话记忆：** 证据由工具产生，引用由 Java 验真。
 
-## 29. 其他
+## 5.6 Intent / Robot Control 问题
 
-### Q14：意图识别为什么不配工具？
+### Q15：意图识别为什么不配工具？
 
 **推荐回答：** 它只分类，目标是快和稳定。明确命令走规则，复杂文本才四分类；工具越多越慢，也扩大权限。
 
@@ -741,13 +742,29 @@ R2 请求去 B
 
 **一句话记忆：** 路由器只路由，专业 Agent 才用工具。
 
-### Q15：两台机器人为什么还做并发控制？
+### Q16：Robot Control Agent 和 G1 动作模块有什么区别？
 
-**推荐回答：** 人少也可能同时下发或争抢同一展台。数据库条件更新、唯一约束和短事务足以守住不变量，不需要分布式锁。
+**推荐回答：** Robot Control Agent 理解“向前一点再挥手”等自然语言，选择受控技能并生成参数；Java 完成权限、状态和范围校验后生成 RobotCommand。G1 模块接收已批准命令，负责互斥、取消、SDK 调用和状态回传。
 
-**追问：** 扩到十几台要重写吗？保留状态和约束，再按吞吐决定基础设施。
+**追问：** 为什么不能让模型直接调用 SDK？模型输出不是可信控制指令，必须经过 Java 门禁和机器人本机安全层。
 
-**一句话记忆：** 用最小机制守住并发不变量。
+**一句话记忆：** Control Agent 选技能，G1 模块执行技能。
+
+## 5.7 一分钟项目介绍
+
+我参与的是一个多机器人具身智能展厅项目，主要负责 Spring Boot 中央调度平台、中央规划 Agent，以及 G1 动作编排与执行模块。平台围绕 Robot、Task、Plan、PlanStep、RobotCommand 和 RobotEvent 建模，支持任务创建、计划审核、机器人分配、命令下发和进度查询。Planning Agent 由 Java 先准备在线、空闲、区域和展台候选，再由模型生成结构化 PlanDraft，通过业务 Validator 和有限 Reviser 修订，人工审核后才原子分配机器人。执行侧使用 commandId 幂等、UNKNOWN 对账和人工接管处理不确定结果；机器人动作由 G1ControlServer、RobotController 和独立 SDK Worker 执行。QA Agent 使用请求级工具、TaskStep 级 ChatMemory 和按需 RAG 保证多机器人问答隔离。
+
+## 5.8 三分钟项目介绍
+
+项目要解决的是两台机器人同时承担展厅接待时，中央平台怎样把自然语言需求变成计划，并可靠推进导航、讲解和动作。Java 平台采用模块化单体和 PostgreSQL，以 Task 表示一次接待，以审核后的 Plan 和 PlanStep 表示执行顺序，以 RobotCommand 表示一次设备调用，以 RobotEvent 表示机器人事实。LLM 不直接改状态，Java 根据事件和状态机推进任务。
+
+规划部分采用“Java 管硬约束、LLM 管语义偏好、Java 再校验”。Java 先筛出 ONLINE、IDLE、区域和能力满足的机器人以及开放展台，组成 PlanEvidence。模型可按需查询展台主题等规划知识，输出建议机器人和路线的 PlanDraft。Schema 与 Bean Validation 保证格式能读，业务 Validator 检查候选、重复、mustVisit、avoid 和证据 ID。第一次不合法时把错误交给 Reviser，总共最多三次模型尝试；随后仍需人工审核。下发时再次查询最新状态，并用条件 UPDATE 原子完成 IDLE 到 ASSIGNED，失败显式返回 ASSIGN_CONFLICT。
+
+可靠执行方面，每条命令有 commandId 和 payloadHash，重复请求返回历史结果；RobotCommand 与 Outbox 同事务保存。网络超时进入 UNKNOWN，而不是直接判失败，平台按原 commandId 查询或幂等重发，仍不确定则暂停并人工接管。G1 侧由 bot_mind 接入 G1ControlServer，RobotController 协调导航和动作，UnitreeSdkBridge 通过独立 Python Worker 隔离 SDK。动作按 snapshot、motion、script 分层，并对 navigation、manual、script 做互斥和取消。
+
+问答部分使用共享 KnowledgeQaAgent/ChatClient 和每请求 QaTools。工具绑定 robotId、taskId、stepId、exhibitCode 和 knowledgeVersion；conversationId 以 TaskStep 隔离。模型按需选择 RAG、天气、联网或不调用工具，Java 校验本轮真实 evidenceId。Intent ChatClient 只做路由，Robot Control Agent 只选择白名单技能，真正执行仍经过 Java 门禁和 G1 安全层。这样既保留模型的语义能力，也保证业务状态与硬件控制可验证。
+
+> **本部分小结**：面试回答应始终围绕“解决了什么问题、为什么这样设计、异常如何处理、哪些是实际实现、哪些是 V2 目标方案”展开。
 
 ---
 
@@ -863,16 +880,39 @@ RESERVED → EXPIRED；OCCUPIED → UNKNOWN
 
 ---
 
-## 最后的面试表达边界
+## 附录 G：展台容量与后续扩展
+
+### G.1 展台容量、候补与等待体验
+
+R1 正在 B 讲解，R2 下一站也是 B 时，R2 不能先过去。每个 Task 对目标展台只有一条 ExhibitAllocation：
 
 ```text
-我负责的业务问题
-→ 六个核心对象和任务执行链
-→ Planning Agent 中 Java 与 LLM 的边界
-→ 命令可靠性和状态闭环
-→ G1 动作执行链与互斥
-→ QA Agent 作为 AI 增强
-→ V2 仍计划完善的生产能力
+WAITING  候补，不占容量
+RESERVED 已预约，短时占容量
+OCCUPIED 已到达并占用
+RELEASED 已离开
 ```
 
-不要用技术名词数量证明复杂。面试官更关心状态由谁维护、失败如何恢复、并发不变量怎样保证、模型为何不会越权，以及你能否区分真实实现与目标设计。
+同一记录以状态字段演进，不另建重复的候补表。
+
+```text
+R2 请求去 B
+→ Java 发现 R1 OCCUPIED
+→ R2 进入 WAITING，前端显示候补
+→ R2 留在 A 开放问答或播备用讲稿
+→ R1 完成当前问题并提示前往下一站
+→ R1 离开且清场确认
+→ 同一事务释放 R1、将首个候补改为 RESERVED
+→ R2 再校验预约和控制权后导航
+```
+
+默认冲突处理是 Java 状态机，不经过 Agent。只有要判断“换哪个展台更符合偏好”时才有限重规划。强制清场也不能绕过安全确认和工作人员策略。
+
+### G.2 后续扩展
+
+- 有限重规划：展台长期不可用时，用剩余 Step 和最新候选重新生成草案；
+- 巡检复用：复用 Task/Plan/Step/Command 主干，巡检指标另建模；
+- 跨楼层接力：增加换层点、能力和人工交接；
+- 动态 ETA：有真实导航和排队数据后再建模，不能由 Agent 猜。
+
+这些属于 P1/P2，不占用核心项目介绍时间。
