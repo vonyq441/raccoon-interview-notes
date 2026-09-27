@@ -38,7 +38,7 @@
 → 命令可靠执行
 → G1 机器人执行
 → QA Agent
-→ Intent / Robot Control Agent
+→ Intent / 动作 Agent（Robot Control Agent）
 ~~~
 
 第一次阅读先完成第一至第四部分的业务主线，再看第五部分面试题。认证、设备安全、部署、完整数据库和高级扩展放到第二遍查阅。
@@ -406,7 +406,7 @@ G1ControlServer 统一承接需要持续反馈的导航 Action、短时控制 Se
 - RobotController 组合导航、运动和安全状态；
 - UnitreeSdkBridge / Worker 隔离 SDK。
 
-Robot Control Agent 是 Java 的自然语言技能选择层；本章是实际执行层。前者提出“调哪个技能及参数”，后者保证真正、安全、可取消地执行。
+动作 Agent（文档中的 Robot Control Agent）运行在 Java/Spring AI 一侧。它会直接发起已经注册的机器人 Tool Calling；Java 工具包装层在同一次调用内完成参数门禁、机器人选择和命令记录，再把 `tools/call` 转给 bot_mind。本章描述的是工具调用之后的实际执行层，它负责让动作真正、安全、可取消地执行。
 
 ## 3.3 为什么使用独立 Python Worker
 
@@ -569,9 +569,9 @@ ROBOT_CONTROL / KNOWLEDGE_QA / CENTRAL_PLANNING / OTHER
 
 分类失败或置信不足时澄清，不能猜测具有副作用的路由。
 
-## 4.8 Robot Control Agent
+## 4.8 动作 Agent（Robot Control Agent）
 
-“向前走一点，然后挥手”被映射为白名单技能：
+“向前走一点，然后挥手”会由动作 Agent 直接选择并调用白名单技能：
 
 ```json
 {"actions":[
@@ -582,21 +582,36 @@ ROBOT_CONTROL / KNOWLEDGE_QA / CENTRAL_PLANNING / OTHER
 
 ```text
 自然语言
-→ Robot Control Agent 选择技能和参数
-→ Java 校验权限、参数、状态、控制权
-→ RobotCommand
-→ bot_mind / G1ControlServer
-→ G1 模块执行并回传
+→ 动作 Agent 的 ChatClient
+→ 模型生成 tool_call：play_named_action(name = "wave")
+→ Spring AI 调用已注册的 RobotSkillTool
+→ 工具包装层校验权限、参数、机器人状态和控制权
+→ 记录 RobotCommand / commandId
+→ MCP Client 向指定 bot_mind 发送 JSON-RPC tools/call
+→ PlayNamedActionTool
+→ G1ControlServer / RobotController / SDK Worker
+→ 工具结果返回动作 Agent，状态事件回到 Java
 ```
 
-模型不能拥有任意 URL、Shell 或 SDK 权限。Robot Control Agent 负责理解并提出技能调用；G1 模块负责实际执行和硬件安全。
+这里的“直接调用”是指动作 Agent 直接触发 Tool Calling，不是先输出一份动作草案，再由另一个业务 Agent 决定是否调用。因为动作 Agent 与 ToolCallback 都运行在 Java 应用中，权限校验和 RobotCommand 记录可以放在工具包装层里完成，并不会多出一个决策层。
+
+模型仍不能拥有任意 URL、Shell 或 SDK 权限。它只看得到当前机器人允许使用的工具定义和参数 Schema；真正的 JSON-RPC 请求由 Java ToolCallback/MCP Client 发出，物理执行和硬件安全由 G1 模块负责。
+
+还要区分两种入口：
+
+| 场景 | 谁发起机器人工具调用 | 是否需要再次调用模型 |
+|---|---|---|
+| 游客临时说“挥手”“向前一点” | 动作 Agent 根据自然语言直接 Tool Calling | 需要，由模型选择工具和参数 |
+| 已审核 PlanStep 中已经写明 `PLAY_ACTION(wave)` | Java Step Executor 直接调用同一个 RobotSkillTool | 不需要，动作已经确定 |
+
+因此不能说“所有机器人动作都必须经过动作 Agent”。自然语言动作经过动作 Agent；已经结构化的计划步骤由确定性任务引擎执行。两条路径复用同一套 Java 工具门禁、RobotCommand、bot_mind MCP 工具和 G1 执行链。
 
 ## 4.9 本部分小结
 
 ~~~text
 QA Agent：按问题选择 RAG / Weather / Web / 0 Tool
 Intent ChatClient：只分类，不调用工具
-Robot Control Agent：把自然语言映射为白名单技能
+动作 Agent：根据自然语言选择并直接发起白名单 Tool Calling
 G1 执行层：真正执行技能并保障硬件安全
 ~~~
 
@@ -742,13 +757,13 @@ ChatMemory 管“之前聊过什么”，请求级 QaTools 管“当前允许查
 
 **一句话记忆：** 路由器只路由，专业 Agent 才用工具。
 
-### Q16：Robot Control Agent 和 G1 动作模块有什么区别？
+### Q16：动作 Agent 是不是直接控制机器人？它和 G1 动作模块有什么区别？
 
-**推荐回答：** Robot Control Agent 理解“向前一点再挥手”等自然语言，选择受控技能并生成参数；Java 完成权限、状态和范围校验后生成 RobotCommand。G1 模块接收已批准命令，负责互斥、取消、SDK 调用和状态回传。
+**推荐回答：** 动作 Agent 会直接触发已注册工具的 Tool Calling，例如选择 `play_named_action` 并生成 `wave` 参数；这里的直接是相对业务编排而言，不代表模型直接操作 SDK。Spring AI 的 ToolCallback 在 Java 内完成门禁和 RobotCommand 记录，再通过 MCP `tools/call` 调 bot_mind。G1 模块接收调用，负责互斥、取消、SDK 执行和状态回传。已结构化的 PlanStep 则由 Step Executor 直接调用同一工具，不必再经过模型。
 
 **追问：** 为什么不能让模型直接调用 SDK？模型输出不是可信控制指令，必须经过 Java 门禁和机器人本机安全层。
 
-**一句话记忆：** Control Agent 选技能，G1 模块执行技能。
+**一句话记忆：** 动作 Agent 直接调受控工具，G1 模块实际驱动硬件。
 
 ## 5.7 一分钟项目介绍
 
@@ -762,7 +777,7 @@ ChatMemory 管“之前聊过什么”，请求级 QaTools 管“当前允许查
 
 可靠执行方面，每条命令有 commandId 和 payloadHash，重复请求返回历史结果；RobotCommand 与 Outbox 同事务保存。网络超时进入 UNKNOWN，而不是直接判失败，平台按原 commandId 查询或幂等重发，仍不确定则暂停并人工接管。G1 侧由 bot_mind 接入 G1ControlServer，RobotController 协调导航和动作，UnitreeSdkBridge 通过独立 Python Worker 隔离 SDK。动作按 snapshot、motion、script 分层，并对 navigation、manual、script 做互斥和取消。
 
-问答部分使用共享 KnowledgeQaAgent/ChatClient 和每请求 QaTools。工具绑定 robotId、taskId、stepId、exhibitCode 和 knowledgeVersion；conversationId 以 TaskStep 隔离。模型按需选择 RAG、天气、联网或不调用工具，Java 校验本轮真实 evidenceId。Intent ChatClient 只做路由，Robot Control Agent 只选择白名单技能，真正执行仍经过 Java 门禁和 G1 安全层。这样既保留模型的语义能力，也保证业务状态与硬件控制可验证。
+问答部分使用共享 KnowledgeQaAgent/ChatClient 和每请求 QaTools。工具绑定 robotId、taskId、stepId、exhibitCode 和 knowledgeVersion；conversationId 以 TaskStep 隔离。模型按需选择 RAG、天气、联网或不调用工具，Java 校验本轮真实 evidenceId。Intent ChatClient 只做路由；动作 Agent 直接触发白名单 Tool Calling，但调用仍经过 Java 工具门禁和 G1 安全层。已经结构化的 PlanStep 由任务引擎直接调用同一工具，不重复调用模型。这样既保留模型的语义能力，也保证业务状态与硬件控制可验证。
 
 > **本部分小结**：面试回答应始终围绕“解决了什么问题、为什么这样设计、异常如何处理、哪些是实际实现、哪些是 V2 目标方案”展开。
 
@@ -867,7 +882,7 @@ RESERVED → EXPIRED；OCCUPIED → UNKNOWN
 
 ## 附录 F：实现顺序与源码核对入口
 
-建议顺序：基础实体与 Task 闭环 → Planning Agent → 命令可靠执行 → G1 真机接入 → QA Agent → Intent 与 Robot Control Agent → 外围能力。
+建议顺序：基础实体与 Task 闭环 → Planning Agent → 命令可靠执行 → G1 真机接入 → QA Agent → Intent 与动作 Agent → 外围能力。
 
 已有机器人代码核对入口：
 
