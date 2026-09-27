@@ -12,7 +12,7 @@
 
 系统边界可以先记成三句话：
 
-1. **模型提出建议**，不直接改变任务状态，也不直接控制硬件。
+1. **模型受控调用能力**：LLM/Agent 可以通过白名单 bot_mind Tool Calling 发起机器人能力调用，但不能绕过 Tool 门禁直接访问 ROS2、Unitree SDK、Shell 或任意机器人接口；Task、Step 等业务状态仍由 Java 修改。
 2. **Java 保存事实并作决定**，负责校验、事务、权限、幂等和状态推进。
 3. **机器人执行并回报结果**，路径规划和硬件安全留在机器人侧。
 
@@ -51,13 +51,22 @@
 → PlanDraft
 → Java Validator
 → 人工审核
+→ 点击下发并原子绑定 Robot
 → Plan / PlanStep
-→ RobotCommand
-→ bot_mind / G1ControlServer 执行
+→ Step Executor 或动作 Agent
+→ Java ToolCallback / CommandService
+→ 短事务写入 RobotCommand + CommandOutbox
+→ COMMIT 后由 CommandDispatcher 发送
+→ MCP tools/call
+→ bot_mind
+→ G1ControlServer / RobotController
 → RobotEvent
-→ Java 推进下一 Step
+→ Java 更新 Command / Step / Task
+→ 下一 PlanStep
 → Task COMPLETED
 ~~~
+
+没有动态要求时由 Step Executor 执行确定性模板；存在现场自然语言要求时由动作 Agent 动态编排当前机器人的 bot_mind Tools。
 
 当前项目边界是 2 台机器人、单展厅、Spring Boot 模块化单体、PostgreSQL 和 Spring AI。bot_mind 与 g1_base 是已有机器人侧代码；本文重点说明 Java 中央平台和智能体如何组织并接入机器人。文中的“目标”“建议”“V2”表示深化设计，不能自动等同于原项目已上线能力。
 
@@ -89,7 +98,7 @@
 | Task | 一批访客的一次完整接待任务 | taskId, requirement, status, assignedRobotId |
 | Plan | Task 经人工审核后的执行路线 | planId, taskId, version, status |
 | PlanStep | 一个业务阶段，例如 `VISIT A03`；不展开机器人内部每个动作 | stepId, type, targetCode, sequence, status |
-| RobotCommand | 动作 Agent 或默认执行器实际发起的一次 bot_mind Tool 调用 | commandId, stepId, toolName, payload, status |
+| RobotCommand | Step Executor 或动作 Agent 经 CommandService 发起的一次有副作用的 bot_mind Tool 调用 | commandId, stepId, toolName, payload, status |
 | RobotEvent | 机器人针对某条 RobotCommand 回传的执行事实 | eventId, commandId, type, occurredAt |
 
 ```text
@@ -120,7 +129,8 @@ PlanStep S3：VISIT A03
 ```text
 Task CREATED → 生成 PlanDraft → 人工审核 → Plan APPROVED
 → 事务内分配 Robot → Task RUNNING → 执行 Step 1
-→ Command → Event → Java 更新状态 → 下一 Step
+→ Step Executor / 动作 Agent → CommandService → Command + Outbox
+→ CommandDispatcher → tools/call → Event → Java 更新状态 → 下一 Step
 → 全部成功 → Task COMPLETED
 ```
 
@@ -159,20 +169,36 @@ public void handleRobotEvent(RobotEvent event) {
 }
 ```
 
-数据库锁只保护短事务，不在网络请求期间持有。先提交 Command，再调用机器人，响应或异步 Event 用新事务更新。
+数据库锁只保护短事务，不在网络请求期间持有。先在同一短事务提交 RobotCommand 与 CommandOutbox，再由 CommandDispatcher 调用机器人；响应或异步 Event 用新事务更新。
 
 ## 1.5 命令可靠执行
 
-Java 给每条命令唯一 commandId。机器人收到相同 commandId 时，不再次执行，而是返回保存的状态或结果。
+每一次真正对机器人产生副作用的 Tool Calling 都必须先对应一条 RobotCommand。中央 Java 平台生成唯一 commandId，用于幂等、日志、Outbox、Tool 调用追踪、RobotEvent 关联和 `UNKNOWN` 对账；V2 目标是机器人侧在收到相同 commandId 时不重复执行，而是返回已保存的状态或结果。
 
 ```text
 Java 发 C100 → 网络超时 → 不知道是否执行
 Java 重发 C100 → 机器人查到 C100 已接收 → 不重复移动/挥手
 ```
 
-只比较命令类型不够，因为连续两次合法挥手必须允许。机器人应保存 commandId、payloadHash 和结果：同 ID 同参数返回历史结果，同 ID 不同参数拒绝。
+只比较命令类型不够，因为连续两次合法挥手必须允许。机器人侧适配层应保存 commandId、payloadHash 和结果：同 ID 同参数返回历史结果，同 ID 不同参数拒绝。
 
-创建 RobotCommand 与 Outbox 待发送记录放在同一事务；后台发送器轮询 Outbox。Java 即使在提交后、发送前重启，命令仍可恢复发送，当前规模无需引入消息队列。
+```text
+Step Executor / 动作 Agent
+        ↓
+Java ToolCallback / CommandService
+        ↓
+短事务：RobotCommand + CommandOutbox
+        ↓ COMMIT
+CommandDispatcher
+        ↓ MCP tools/call
+目标 Robot 的 bot_mind
+        ↓ tool_result / RobotEvent
+Java 更新 Command / Step
+```
+
+正常情况下，事务提交后立即触发 CommandDispatcher 尝试发送，不故意等待下一轮定时扫描。Outbox Poller 只承担恢复：如果 RobotCommand 与 CommandOutbox 已提交，而 Java 在真正执行 `MCP tools/call` 前崩溃，服务恢复后 Poller 找出未发送记录，并使用原 commandId 交给同一个 CommandDispatcher 恢复发送。**Outbox 不是为了把正常机器人调用变成慢速定时任务，而是保证数据库已经记录命令、但进程在发送前崩溃时仍可恢复。** 当前规模无需引入消息队列。
+
+动作 Agent 的 Tool Calling 与 Step Executor 的确定性调用都经过这条 CommandService / CommandDispatcher 链，不能绕过 RobotCommand 与 Outbox 直连 MCP。当前 bot_mind 的真实 MCP Tool 参数未必都原生包含 commandId，因此 V2 只要求 Java 调用链能把 commandId 与机器人侧执行关联；具体可通过 MCP 参数、调用上下文或机器人侧适配层透传，以实际接口实现为准，不能把尚未存在的参数写成当前能力。
 
 请求超时先进入 UNKNOWN，因为“没收到结果”不等于“没执行”：
 
@@ -191,9 +217,9 @@ Event 仍由 1.4 节的事件处理器落库和推进状态；本节重点是在
 Task              一次完整接待任务
 Plan              人工审核后的业务路线
 PlanStep          一个业务阶段，例如 VISIT A03
-RobotCommand      动作 Agent / 执行器发起的一次 bot_mind Tool 调用
+RobotCommand      Step Executor / 动作 Agent 经 CommandService 记录的一次有副作用 Tool 调用
 RobotEvent        机器人对该次调用返回的执行事实
-commandId         保证同一次命令不重复执行
+commandId         标识同一次命令，支撑幂等、追踪与 UNKNOWN 对账
 UNKNOWN           表示结果暂时无法确认
 ~~~
 
@@ -427,8 +453,12 @@ PlanEvidence
 ## 3.1 从 Java 到机器人的完整调用链
 
 ```text
-Java 中央平台
-  ↓ commandId + 业务命令
+Step Executor / 动作 Agent
+  ↓ Java ToolCallback / CommandService
+短事务：RobotCommand + CommandOutbox
+  ↓ COMMIT 后由 CommandDispatcher 发送
+MCP tools/call（关联 commandId）
+  ↓
 bot_mind
   ↓ 本机 ROS2 调用
 G1ControlServer
@@ -450,7 +480,7 @@ G1ControlServer 统一承接需要持续反馈的导航 Action、短时控制 Se
 - RobotController 组合导航、运动和安全状态；
 - UnitreeSdkBridge / Worker 隔离 SDK。
 
-动作 Agent（文档中的 Robot Control Agent）和确定性的 Step Executor 都是 bot_mind Tool 的调用方：固定流程由 Step Executor 调用，现场要求改变当前 Step 的执行方式时由动作 Agent 动态编排。Java 工具包装层在同一次调用内完成参数门禁、机器人选择和命令记录，再把 `tools/call` 转给 bot_mind。本章描述工具调用之后的实际执行层，它负责让动作真正、安全、可取消地执行。
+动作 Agent（文档中的 Robot Control Agent）和确定性的 Step Executor 都是 bot_mind Tool 的调用方：固定流程由 Step Executor 发起，现场要求改变当前 Step 的执行方式时由动作 Agent 动态编排。两者都先进入 Java ToolCallback / CommandService，完成参数门禁和机器人选择，并在短事务内写入 RobotCommand 与 CommandOutbox；事务提交后再由同一个 CommandDispatcher 执行 `tools/call`。本章描述工具调用之后的实际执行层，它负责让动作真正、安全、可取消地执行。
 
 ## 3.3 为什么使用独立 Python Worker
 
@@ -650,7 +680,7 @@ public record ExecutionContext(
 
 它回答的是：当前哪个 Task 和 Step、控制哪台机器人、目标点位是什么、机器人现在在哪里、该 Step 已完成到哪里、现场有没有临时要求。
 
-机器人能力的定义来自每台机器人上的 bot_mind。Java/Spring AI 是 MCP Client 和 Tool Consumer，通过 `tools/list` 获取工具定义，通过 `tools/call` 调用。当前源码中的代表性工具包括：
+机器人能力的定义来自每台机器人上的 bot_mind。Java/Spring AI 是 MCP Client 和 Tool Consumer，通过 `tools/list` 获取工具定义；实际 `tools/call` 必须经过下文的 ToolCallback、CommandService 和 CommandDispatcher。当前源码中的代表性工具包括：
 
 | 能力 | bot_mind 当前真实 Tool |
 |---|---|
@@ -664,20 +694,19 @@ public record ExecutionContext(
 当前源码没有启用名为 `activate_waypoint` 的 MCP Tool，因此本文使用真实的 `booth_show` 表达“播放当前展台讲稿、TTS 和配置动作”。如果未来提供 `activate_waypoint`，它只能作为新的实际 Tool 名称，不能仅为文档概念虚构生产接口。
 
 ```text
-R1
-└─ bot_mind（Tool Provider）
-   ├─ navigate_to / get_current_waypoint
-   ├─ move_distance / rotate_robot
-   ├─ play_named_action / execute_arm_action
-   ├─ booth_show / booth_continue / stop_speaking
-   └─ stop_robot
-          ↑
-          │ MCP tools/list / tools/call
-          │
 动作 Agent 或 Step Executor（Tool Consumer）
+  ↓ Spring AI ToolCallback
+Java CommandService / CommandDispatcher
+  ↓ MCP tools/call
+R1 bot_mind（Tool Provider）
+  ├─ navigate_to / get_current_waypoint
+  ├─ move_distance / rotate_robot
+  ├─ play_named_action / execute_arm_action
+  ├─ booth_show / booth_continue / stop_speaking
+  └─ stop_robot
 ```
 
-Java 中的 RobotSkillTool 是受控代理或适配层：选择目标 robotId，校验权限、参数、状态和控制权，生成 commandId 并记录 RobotCommand，然后把同一能力转发给 bot_mind。它不重新实现导航、TTS 或机器人动作。
+Java 中的 RobotSkillTool 是受控 ToolCallback：它选择目标 robotId，校验权限、参数、状态和控制权，再调用 CommandService。CommandService 生成 commandId，并在短事务内记录 RobotCommand 与 CommandOutbox；提交后由 CommandDispatcher 把同一能力转发给 bot_mind。它们不重新实现导航、TTS 或机器人动作。
 
 ### 4.8.3 Tool Calling 执行循环
 
@@ -686,15 +715,16 @@ Java 中的 RobotSkillTool 是受控代理或适配层：选择目标 robotId，
 ```text
 动作 Agent 读取 ExecutionContext
 → LLM 产生 tool_call：navigate_to(A03)
-→ Java 包装层记录 Command C101
-→ MCP tools/call → R1 bot_mind
-→ tool_result / RobotEvent：C101 SUCCEEDED
+→ Java ToolCallback / CommandService 创建 C101 + Outbox
+→ COMMIT → CommandDispatcher → MCP tools/call → R1 bot_mind
+→ tool_result / RobotEvent → Java 更新 C101 为 SUCCEEDED
 → 结果重新进入动作 Agent
 → LLM 产生 tool_call：play_named_action(wave)
-→ Java 包装层记录 Command C102
-→ tool_result / RobotEvent：C102 SUCCEEDED
-→ 动作 Agent 判断需要等待现场指令
-→ S3 进入 WAITING_INTERACTION
+→ 同一链路创建并执行 C102
+→ tool_result / RobotEvent → Java 更新 C102 为 SUCCEEDED
+→ 动作 Agent 返回“需要等待现场交互”的执行结果
+→ Java Task/Step 状态机校验当前活动 Step
+→ Java 将 S3 更新为 WAITING_INTERACTION
 ```
 
 模型根据观察到的工具结果决定下一步，这构成受限的“观察—调用—再观察”循环，所以它比只输出 `ROBOT_CONTROL` 标签的意图分类器更接近 Agent。循环仍受工具白名单、最大调用次数、超时和 Step 边界约束，不能无限自主运行。
@@ -715,9 +745,13 @@ PlanStep = VISIT A03
 navigate  动态 Tool Calling
 → booth_show   navigate → action → wait → booth_show
        \       /
-        bot_mind
-           ↓
-      完成当前 Step
+ ToolCallback / CommandService
+            ↓
+ RobotCommand + Outbox → CommandDispatcher
+            ↓
+    MCP tools/call → bot_mind
+            ↓
+       完成当前 Step
 ```
 
 默认情况下，`VISIT A03` 的确定性模板可以直接执行：
@@ -750,16 +784,24 @@ navigate_to(A03)
 → C101 / 导航成功
 → play_named_action("wave")
 → C102 / 动作成功
-→ WAITING_INTERACTION
+→ 返回“需要等待现场交互”的执行结果
+
+Java Task/Step 状态机：
+确认 T100 / S3 / R1 仍为当前活动执行上下文
+→ S3 → WAITING_INTERACTION
 ```
 
-此时 S3 不能标记为 `SUCCEEDED`，因为 A03 接待尚未完成。用户随后说“开始讲吧”，Java 用同一个 taskId、stepId、robotId 和 targetCode 重新组装 ExecutionContext，动作 Agent 继续执行：
+此时 S3 不能标记为 `SUCCEEDED`，因为 A03 接待尚未完成。用户随后说“开始讲吧”，继续流程仍由 Java 把守：
 
 ```text
-booth_show(user_text = "开始讲解展台")
-→ C103 / 讲解完成
-→ Java 校验当前 Step 整体完成条件
-→ S3 SUCCEEDED
+Java 确认 taskId / stepId / robotId 仍匹配当前活动 Step
+→ 重新构造 ExecutionContext
+→ 动作 Agent 继续 Tool Calling
+→ booth_show(user_text = "开始讲解展台")
+→ CommandService / CommandDispatcher 执行 C103
+→ 执行结果返回
+→ Java 校验 VISIT 整体完成条件
+→ S3 → SUCCEEDED
 → 推进 S4 = VISIT B05
 ```
 
@@ -767,7 +809,7 @@ booth_show(user_text = "开始讲解展台")
 
 `WAITING_INTERACTION` 表示 Step 仍在执行，只是在等待用户继续指令。继续请求必须携带或解析到同一个 taskId、stepId 和 robotId；若当前 Step 已被取消或任务已被人工接管，旧的“开始吧”不能恢复执行。
 
-每次 Tool Calling 对应一条 RobotCommand，每个执行事实对应 RobotEvent：
+每次真正产生机器人副作用的 Tool Calling 对应一条 RobotCommand，每个执行事实对应 RobotEvent：
 
 ```text
 C101：navigate_to(A03)         → SUCCEEDED
@@ -795,6 +837,12 @@ ExecutionContext + 现场要求 + R1 Tools
         ↓
 Tool Calling
         ↓
+Java ToolCallback / CommandService
+        ↓
+RobotCommand + CommandOutbox
+        ↓
+CommandDispatcher → MCP tools/call
+        ↓
 navigate_to / play_named_action / booth_show
         ↓
 bot_mind
@@ -816,7 +864,7 @@ bot_mind       → 定义机器人能做什么，并执行具体 Tool
 Java           → 保存业务事实、实施安全门禁并推进 Task
 ```
 
-动作 Agent 不直接调用 Unitree SDK，也不修改 Task、Step 数据库状态。面试时应如实表达：“动作 Agent 不是我主责开发的模块，但因为它与我负责的中央平台和 G1 执行模块直接协作，我后续系统梳理过它的 Tool Calling 和执行上下文机制。”
+动作 Agent 可以通过白名单 Tool Calling 发起机器人能力调用，但不能绕过 Tool 门禁直接访问 ROS2、Unitree SDK、Shell 或任意机器人接口，也不能修改 Task、Step 数据库状态。面试时应如实表达：“动作 Agent 不是我主责开发的模块，但因为它与我负责的中央平台和 G1 执行模块直接协作，我后续系统梳理过它的 Tool Calling 和执行上下文机制。”
 
 ## 4.9 本部分小结
 
@@ -884,7 +932,7 @@ ChatMemory 管“之前聊过什么”，请求级 QaTools 管“当前允许查
 
 ### Q6：幂等是不是重复命令不再执行？
 
-**推荐回答：** 对同一 commandId 是。机器人保存 payloadHash 和结果；同 ID 同参数返回历史结果，同 ID 不同参数拒绝。两次正常挥手使用不同 ID。
+**推荐回答：** 对同一 commandId 是。commandId 由 Java 生成，V2 要求机器人侧适配层关联 commandId、payloadHash 和结果；同 ID 同参数返回历史结果，同 ID 不同参数拒绝。两次正常挥手使用不同 ID。现有 Tool 是否原生携带 commandId 要以真实接口为准，不能把目标设计说成已有能力。
 
 **追问：** 超时重发用什么 ID？必须用原 ID。
 
@@ -974,7 +1022,7 @@ ChatMemory 管“之前聊过什么”，请求级 QaTools 管“当前允许查
 
 **推荐回答：** Planning Agent 决定机器人和展台路线，PlanStep 保存 `VISIT A03` 这样的业务目标。动作 Agent 结合当前 ExecutionContext、机器人状态和现场自然语言要求，动态选择并组合 R1 的 bot_mind Tools，例如先 `navigate_to`，到站后 `play_named_action`，再根据用户指令决定何时 `booth_show`。Java 记录 Command/Event 并推进状态，bot_mind 和 G1 执行具体技能。
 
-**追问：** 动作 Agent 能直接调用 Unitree SDK 或修改 Step 状态吗？不能，它只调用白名单 MCP Tools，硬件执行归 G1，业务状态归 Java。
+**追问：** 动作 Agent 能直接调用 Unitree SDK 或修改 Step 状态吗？不能。它可以通过白名单 MCP Tools 发起机器人能力调用，但不能绕过 Tool 门禁访问 ROS2、SDK、Shell 或任意机器人接口；业务状态只由 Java 修改。
 
 **一句话记忆：** Planning 决定去哪，动作 Agent 决定当前 Step 动态怎么完成。
 
@@ -996,7 +1044,7 @@ ChatMemory 管“之前聊过什么”，请求级 QaTools 管“当前允许查
 
 ### Q19：“先过去别讲，到了挥手，等我说开始再讲”怎样执行？
 
-**推荐回答：** 当前 Step 仍是 `S3 = VISIT A03`。动作 Agent 先调用 `navigate_to(A03)`，成功后调用 `play_named_action(wave)`，然后让 S3 进入 `WAITING_INTERACTION`，不能标记成功。用户说“开始”后，基于相同 taskId、stepId 和 robotId 调用 `booth_show`；讲解完成且 Java 校验整体条件后，S3 才进入 `SUCCEEDED` 并推进下一站。
+**推荐回答：** 当前 Step 仍是 `S3 = VISIT A03`。动作 Agent 先调用 `navigate_to(A03)`，成功后调用 `play_named_action(wave)`，再返回“需要等待现场交互”的结果，由 Java 将 S3 更新为 `WAITING_INTERACTION`，此时不能标记成功。用户说“开始”后，Java 先确认 taskId、stepId 和 robotId 仍匹配当前活动 Step，再重建 ExecutionContext，让动作 Agent 继续调用 `booth_show`；讲解完成且 Java 校验整体条件后，S3 才进入 `SUCCEEDED` 并推进下一站。
 
 **追问：** 其中每次调用怎样留痕？导航、挥手和讲解分别生成 C101、C102、C103，并接收各自 RobotEvent。
 
@@ -1014,7 +1062,7 @@ ChatMemory 管“之前聊过什么”，请求级 QaTools 管“当前允许查
 
 规划部分采用“Java 管硬约束、LLM 管语义偏好、Java 再校验”。Java 先筛出 ONLINE、IDLE、区域和能力满足的机器人以及开放展台，组成 PlanEvidence。模型可按需查询展台主题等规划知识，输出建议机器人和路线的 PlanDraft。Schema 与 Bean Validation 保证格式能读，业务 Validator 检查候选、重复、mustVisit、avoid 和证据 ID。第一次不合法时把错误交给 Reviser，总共最多三次模型尝试；随后仍需人工审核。下发时再次查询最新状态，并用条件 UPDATE 原子完成 IDLE 到 ASSIGNED，失败显式返回 ASSIGN_CONFLICT。
 
-可靠执行方面，每条命令有 commandId 和 payloadHash，重复请求返回历史结果；RobotCommand 与 Outbox 同事务保存。网络超时进入 UNKNOWN，而不是直接判失败，平台按原 commandId 查询或幂等重发，仍不确定则暂停并人工接管。G1 侧由 bot_mind 接入 G1ControlServer，RobotController 协调导航和动作，UnitreeSdkBridge 通过独立 Python Worker 隔离 SDK。动作按 snapshot、motion、script 分层，并对 navigation、manual、script 做互斥和取消。
+可靠执行方面，每条命令有 commandId 和 payloadHash，重复请求返回历史结果；RobotCommand 与 Outbox 同事务保存，提交后 CommandDispatcher 立即尝试发送，Outbox Poller 只在进程崩溃等异常后恢复未发送记录。网络超时进入 UNKNOWN，而不是直接判失败，平台按原 commandId 查询或幂等重发，仍不确定则暂停并人工接管。G1 侧由 bot_mind 接入 G1ControlServer，RobotController 协调导航和动作，UnitreeSdkBridge 通过独立 Python Worker 隔离 SDK。动作按 snapshot、motion、script 分层，并对 navigation、manual、script 做互斥和取消。
 
 问答部分使用共享 KnowledgeQaAgent/ChatClient 和每请求 QaTools。工具绑定 robotId、taskId、stepId、exhibitCode 和 knowledgeVersion；conversationId 以 TaskStep 隔离。模型按需选择 RAG、天气、联网或不调用工具，Java 校验本轮真实 evidenceId。Intent ChatClient 只做路由。对于 `VISIT A03` 这类业务 Step，没有临时要求时由 Step Executor 执行 `navigate_to → booth_show` 默认模板；出现“先挥手、暂时别讲”等现场要求时，动作 Agent 才结合 ExecutionContext 动态编排 bot_mind Tools。动作 Agent 不是我主责开发的模块，但我系统梳理了它与中央平台和 G1 执行层的协作边界。这样既保留模型的语义能力，也避免所有固定流程都依赖 LLM。
 
