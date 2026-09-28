@@ -100,6 +100,30 @@
 | RobotCommand | 中央平台对一次有副作用的机器人 Tool Calling 保存的持久化执行记录 | commandId, taskId, stepId, robotId, toolName, payload, status |
 | RobotEvent | 机器人实际执行过程中产生的事实，也是 Java 状态机的输入 | eventId, commandId, type, occurredAt |
 
+### PlanStep.type：业务步骤类型
+
+`PlanStep.type` 描述“这一阶段业务上要完成什么”，不描述机器人底层具体执行什么动作。第一版只保留少量稳定类型：
+
+| PlanStep.type | 业务含义 | targetCode | 典型完成条件 | 动作 Agent 可能使用的 bot_mind Tool |
+|---|---|---|---|---|
+| `VISIT` | 到指定展台并完成该站接待 | `A03`、`B05` | 到达目标展台，并完成该站讲解或接待流程 | `navigate_to`、`booth_show`，必要时 `play_named_action` |
+| `WAIT` | 当前业务流程暂时等待时间或现场指令 | 可为空 | 等待条件满足，例如用户说“继续” | 通常不主动调用动作 Tool；必要时使用 `stop_speaking`、`stop_robot` 等停止类 Tool |
+| `RETURN` | 返回大厅、集合点或指定位置 | `LOBBY`、`HOME` | 到达指定返回点 | `navigate_to` |
+| `END` | 当前接待任务结束 | 可为空 | Java 完成 Task 收尾 | 通常不再产生机器人业务 Tool |
+
+```java
+public enum PlanStepType {
+    VISIT,   // 到目标展台并完成本站接待
+    WAIT,    // 等待时间或现场继续指令
+    RETURN,  // 返回指定集合点
+    END      // 结束任务并由 Java 收尾
+}
+```
+
+这四个值是允许的业务步骤类型，不表示每个 Plan 都必须包含四种步骤。Java 在交给动作 Agent 前校验类型与目标组合：`VISIT`、`RETURN` 必须提供已配置的 targetCode，`WAIT`、`END` 可以为空；模型不能用自由文本临时创造新类型或任意导航目标。
+
+还要区分 `PlanStep.type = WAIT` 与 `PlanStep.status = WAITING_INTERACTION`：前者是计划中明确安排的等待阶段，后者是任意 Step 执行到一半时的运行状态。例如 `VISIT B05` 到站后因“先别讲”进入 `WAITING_INTERACTION`，其 type 仍然是 `VISIT`。
+
 ```text
 Robot 1 ─ n Task（历史上可以执行多个 Task）
 同一时刻，一个 Robot 最多执行一个活动 Task
@@ -111,7 +135,7 @@ RobotCommand 1 ─ n RobotEvent
 
 这组关系表达的是历史记录，不表示机器人可以同时执行多个活动任务。
 
-PlanStep 记录业务目标，不把正常接待拆成 `NAVIGATE / SPEAK / WAVE / WAIT` 等一串中央步骤。以 `S3 = VISIT A03` 为例，动作 Agent 为完成它可能发起多次有副作用的 Tool Calling，每次调用都伴随一条 RobotCommand 记录：
+PlanStep 记录业务目标，不把正常接待拆成 `NAVIGATE / SPEAK / WAVE` 等机器人动作步骤。`WAIT` 只表示业务计划明确要求的等待阶段，导航中的短暂等待或 Tool 内部暂停不会自动生成一个 WAIT Step。以 `S3 = VISIT A03` 为例，动作 Agent 为完成它可能发起多次有副作用的 Tool Calling，每次调用都伴随一条 RobotCommand 记录：
 
 ```text
 PlanStep S3：VISIT A03
@@ -688,7 +712,7 @@ public record ExecutionContext(
     String taskId,
     String stepId,
     String robotId,
-    String stepType,
+    PlanStepType stepType,
     String targetCode,
     String currentRobotState,
     String executionPhase,
@@ -696,7 +720,7 @@ public record ExecutionContext(
 ) {}
 ```
 
-它明确告诉 Agent：执行哪个 Step、控制哪台机器人、目标在哪里、已经完成到哪一步以及本轮有什么临时要求。`targetCode` 来自 Java 查询的正式 Plan，不能由 Agent 猜测。
+它明确告诉 Agent：执行哪个 Step、控制哪台机器人、业务上要完成什么、目标在哪里、已经完成到哪一步以及本轮有什么临时要求。`stepType` 和 `targetCode` 来自 Java 查询的正式 Plan，不能由 Agent 猜测或改写。
 
 机器人能力来自目标机器人上的 bot_mind。Java/Spring AI 通过 `tools/list` 获取 Tool 定义，通过受控 ToolCallback / MCP Client 执行 `tools/call`。当前源码中的代表性工具包括：
 
@@ -710,6 +734,25 @@ public record ExecutionContext(
 | 安全停止 | `stop_robot` |
 
 当前源码没有启用名为 `activate_waypoint` 的 MCP Tool，因此本文使用真实的 `booth_show` 表达“播放当前展台讲稿、TTS 和配置动作”。`get_robot_state`、`get_current_waypoint` 等只读 Tool 可以只留普通 Trace；对机器人产生副作用的 Tool 才必须建立 RobotCommand。
+
+动作 Agent 按三个层次决定下一次 Tool Calling：
+
+1. `stepType` 先限定业务完成目标和允许使用的能力范围；
+2. `targetCode` 提供 Java 已确认的固定业务目标，Agent 不能自行换站；
+3. `currentRobotState`、`executionPhase`、`temporaryInstruction` 等上下文决定现在应该调用哪个 Tool、等待还是结束本 Step。
+
+```text
+VISIT + A03
+├─ 尚未到站                         → navigate_to("A03")
+├─ 已到站 + temporaryInstruction=先别讲 → 返回等待结果，不调用 booth_show
+└─ 已到站 + 允许讲解                 → booth_show(...)
+
+WAIT + targetCode=null              → 通常不调用动作 Tool，返回等待结果
+RETURN + LOBBY                      → navigate_to("LOBBY")
+END + targetCode=null               → 不调用机器人业务 Tool，由 Java 完成 Task 收尾
+```
+
+这不是把 `type` 硬编码成唯一 Tool：`VISIT` 可能因为现场要求增加 `play_named_action`，也可能在到站后先等待。但 Java ToolCallback 仍要校验 Tool 与当前 Step 是否相容，例如 `RETURN LOBBY` 的 `navigate_to` 参数不能被模型改成未授权点位。
 
 ### 4.8.3 Agent 直接 Tool Calling
 
@@ -748,7 +791,7 @@ Robot R1
 PlanStep S3：VISIT A03
 ```
 
-TaskExecutionService 构造 `temporaryInstruction = null` 的 ExecutionContext。动作 Agent 根据 `VISIT + A03` 和 R1 的 Tools 执行标准组合：
+TaskExecutionService 构造 `stepType = VISIT`、`targetCode = A03`、`temporaryInstruction = null` 的 ExecutionContext。动作 Agent 据此判断业务目标是“到 A03 并完成本站接待”，再结合机器人状态执行标准 Tool 组合：
 
 ```text
 tool_call：navigate_to("A03")
@@ -1013,7 +1056,7 @@ ChatMemory 管“之前聊过什么”，请求级 QaTools 管“当前允许查
 
 ### Q16：动作 Agent 到底负责什么？
 
-**推荐回答：** Planning Agent 决定机器人和展台路线，PlanStep 保存 `VISIT A03` 这样的业务目标。动作 Agent 结合当前 ExecutionContext、机器人状态和现场自然语言要求，动态选择并组合 R1 的 bot_mind Tools，例如先 `navigate_to`，到站后 `play_named_action`，再根据用户指令决定何时 `booth_show`。Java 记录 Command/Event 并推进状态，bot_mind 和 G1 执行具体技能。
+**推荐回答：** Planning Agent 决定机器人和展台路线，PlanStep 用 `type + targetCode` 保存 `VISIT A03` 这样的业务目标。动作 Agent 读取 Java 给出的 type、targetCode 和 ExecutionContext：type 限定要完成的业务，targetCode 固定目标，机器人状态、执行阶段和临时要求决定下一次调用哪个 bot_mind Tool。Java 记录 Command/Event 并推进状态，bot_mind 和 G1 执行具体技能。
 
 **追问：** 谁决定当前执行哪个 Step？TaskExecutionService 根据正式 Plan 决定。动作 Agent 直接选择白名单 MCP Tools，但不能猜下一 Step、修改业务状态或绕过 Tool 门禁访问 ROS2、SDK、Shell。
 
