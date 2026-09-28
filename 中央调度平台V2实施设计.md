@@ -8,7 +8,7 @@
 
 ### 0.1 项目一句话介绍
 
-接待员创建参观任务，中央规划 Agent 建议机器人和路线；工作人员审核后，Java 选择当前 PlanStep 并向动作 Agent 提供执行上下文，由动作 Agent 直接调用 bot_mind 的导航、讲解和动作 Tools，Java 再根据调用记录与机器人事件推进任务，形成可查询、可恢复、可人工接管的多机器人接待闭环。
+接待员创建参观任务，中央规划 Agent 建议机器人和路线；工作人员审核后，Java 选择当前 PlanStep 并向动作 Agent 提供执行上下文，由动作 Agent 直接调用 bot_mind 的导航、讲解和动作 Tools，Java 再根据 Tool Result 或异步 RobotEvent 更新 Command 并推进任务，形成可查询、可恢复、可人工接管的多机器人接待闭环。
 
 系统边界可以先记成三句话：
 
@@ -56,14 +56,18 @@
 ↓ 构造 ExecutionContext
 ↓ 动作 Agent
 ↓ tool_call：目标机器人 bot_mind Tool
-├─ Java ToolCallback 伴随记录 RobotCommand
-└─ MCP tools/call → bot_mind / G1 执行
+↓ Java ToolCallback 伴随记录 RobotCommand
+↓ MCP tools/call → bot_mind / G1 执行
 ↓ Tool Result / RobotEvent
-↓ Java 更新 RobotCommand / PlanStep / Task
-├─ Step 未完成：最新 ExecutionContext → 动作 Agent 继续 Tool Calling
-└─ Step 已完成：推进下一 PlanStep
+↓ Java 更新当前 RobotCommand
+↓ TaskExecutionService 重新判断当前 PlanStep
+├─ Step 未完成：新 ExecutionContext → 动作 Agent 继续 Tool Calling
+├─ 需要等待：PlanStep → WAITING_INTERACTION
+└─ Step 已完成：PlanStep → SUCCEEDED → 推进下一 PlanStep
 ↓ Task COMPLETED
 ~~~
+
+图中的 `Tool Result / RobotEvent` 表示执行结果可能来自同步最终返回，也可能来自后续异步反馈，并不要求每次调用同时产生两者。
 
 记录 RobotCommand 和执行 `tools/call` 可以由同一个 Java ToolCallback / MCP Client 调用边界完成；图中的分支表达“同时产生调用记录和真实 Tool 调用”，不是把 Tool 转换成 Command 后再转换回 Tool。
 
@@ -97,8 +101,8 @@
 | Task | 一批访客的一次完整接待任务 | taskId, requirement, status, assignedRobotId |
 | Plan | Task 经人工审核后的执行路线 | planId, taskId, version, status |
 | PlanStep | 一个业务阶段，例如 `VISIT A03`；不展开机器人内部每个动作 | stepId, type, targetCode, sequence, status |
-| RobotCommand | 中央平台对一次有副作用的机器人 Tool Calling 保存的持久化执行记录 | commandId, taskId, stepId, robotId, toolName, payload, status |
-| RobotEvent | 机器人实际执行过程中产生的事实，也是 Java 状态机的输入 | eventId, commandId, type, occurredAt |
+| RobotCommand | 一次有副作用的机器人 Tool Calling 的持久化记录及当前状态快照 | commandId, taskId, stepId, robotId, toolName, payload, status |
+| RobotEvent | 机器人对某次 RobotCommand 的异步执行反馈 | eventId, commandId, type, occurredAt |
 
 ### PlanStep.type：业务步骤类型
 
@@ -130,7 +134,7 @@ Robot 1 ─ n Task（历史上可以执行多个 Task）
 Task  1 ─ 1 Plan
 Plan  1 ─ n PlanStep
 PlanStep 1 ─ n RobotCommand
-RobotCommand 1 ─ n RobotEvent
+RobotCommand 1 ─ 0..n RobotEvent
 ```
 
 这组关系表达的是历史记录，不表示机器人可以同时执行多个活动任务。
@@ -158,29 +162,100 @@ Task CREATED → 生成 PlanDraft → 人工审核 → Plan APPROVED
 → TaskExecutionService 选择当前 Step 并构造 ExecutionContext
 → 动作 Agent 选择并调用 bot_mind Tool
 → ToolCallback 伴随保存 RobotCommand，并执行 tools/call
-→ Tool Result / RobotEvent → Java 更新状态 → 下一 Step
+→ Tool Result / RobotEvent → Java 更新 RobotCommand
+→ TaskExecutionService 重新判断 Step → 必要时继续调用或推进下一 Step
 → 全部成功 → Task COMPLETED
 ```
 
 - LLM 只生成草案、意图或工具参数，不能把 Task 改成 RUNNING。
 - 工作人员审核计划、确认下发、人工接管。
 - Java 是业务事实中心，根据状态机改变 Task、Step、Command。
-- 机器人回传 COMMAND_STARTED、NAVIGATION_SUCCEEDED 等事实事件。
+- 对长耗时调用，机器人可以通过 RobotEvent 异步回传 `STARTED`、`SUCCEEDED`、`FAILED` 或 `CANCELED`。
 
 ## 1.4 命令与事件为什么要分开
 
-可以把三者理解为：
+先用三句话理解：
 
 ~~~text
-PlanStep   = 业务目标
-Tool Call  = 实际调用机器人能力
-Command    = 对这次 Tool Call 的中央执行记录
-Event      = 这次执行实际发生了什么
+Step    = 这一阶段业务上要完成什么
+Command = 这次具体调用了哪个机器人 Tool，以及当前执行到什么状态
+Event   = 机器人后来告诉平台，这次调用实际执行得怎么样
+~~~
+
+其中，**RobotEvent 的第一定义是：机器人对某次 RobotCommand 的异步执行反馈。** “执行事实、Java 状态机输入”可以作为补充理解，但不需要把它上升为复杂领域事件或事件溯源系统。
+
+最小执行例子如下：
+
+~~~text
+PlanStep S3：VISIT B05
+        ↓ 动作 Agent
+tool_call：navigate_to("B05")
+        ↓ Java 记录
+RobotCommand C201
+tool = navigate_to
+status = RUNNING
+        ↓ bot_mind 实际导航
+RobotEvent E201
+commandId = C201
+type = SUCCEEDED
+        ↓ Java
+C201.status → SUCCEEDED
+        ↓
+TaskExecutionService 判断 VISIT B05 是否完成
+├─ 还需要讲解：新 ExecutionContext → 动作 Agent → booth_show(...)
+└─ 业务目标已满足：S3 → SUCCEEDED → 下一 Step
 ~~~
 
 Step 和 Command 不能合并：Step 表达业务目标；动作 Agent 为完成一次 `VISIT A03` 可以依次调用导航、动作和讲解 Tool，每次有副作用的 Tool Calling 各留一条 Command。Command 不是机器人必须理解的中央控制协议，也不是对 Step 的再次翻译。
 
-**Event 是输入事实，Java 状态机是裁判。** Java 要检查 eventId、commandId、机器人身份和当前状态，不能让重复或延迟事件推进错误任务。
+### Command.status 与 RobotEvent
+
+`RobotCommand.status` 是这次 Tool Calling 的**当前执行状态快照**；RobotEvent 是执行过程中收到过的**异步反馈记录**。可以类比为：
+
+~~~text
+RobotCommand.status = 订单当前状态
+RobotEvent           = 物流轨迹
+
+Command C201.status = SUCCEEDED
+表示：这次导航现在已经成功
+
+Event E1 = STARTED
+Event E2 = SUCCEEDED
+表示：机器人先后反馈过哪些执行阶段
+~~~
+
+正文只使用 `STARTED`、`SUCCEEDED`、`FAILED`、`CANCELED` 这组通用反馈；主流程重点关注最终的成功、失败和取消。某种机器人能力如果需要更细的进度展示，可以增加细粒度反馈，但那只服务于界面进度和审计，不是理解主执行链的前提，也不要求每个 Tool 都设计一套专属 Event 类型。
+
+### Tool Result 与 RobotEvent
+
+两者都可能推动 Command 状态更新，但来源和时间不同：
+
+~~~text
+情况 A：Tool 一直等待实际完成
+
+navigate_to("B05")
+→ 机器人真正到达
+→ Tool Result = SUCCEEDED
+→ Java 将 C201.status 更新为 SUCCEEDED
+
+这时同步 Tool Result 已经给出最终结果，
+RobotEvent 不是主流程的必需条件。
+
+情况 B：Tool 很快返回受理结果
+
+navigate_to("B05")
+→ Tool Result = ACCEPTED
+→ Java 只能将 C201.status 更新为 RUNNING
+→ 机器人继续实际导航
+→ RobotEvent(type = SUCCEEDED)
+→ Java 才将 C201.status 更新为 SUCCEEDED
+~~~
+
+因此，Tool Result 表示一次 MCP 调用返回了什么；RobotEvent 表示机器人后续异步执行反馈了什么。对长耗时操作，如果 Tool 只返回 ACK，就必须等待最终 Event 或状态回调，不能直接把 Command 或 Step 标成 `SUCCEEDED`。同步 Tool Result 可以直接更新 Command，不需要被强制转换成 RobotEvent。
+
+### Java 怎样处理 RobotEvent
+
+Java 要检查 eventId、commandId、机器人身份和当前状态，避免重复反馈或错误机器人推进任务：
 
 ```java
 @Transactional
@@ -197,9 +272,31 @@ public void handleRobotEvent(RobotEvent event) {
 }
 ```
 
-例如 C201 记录的是 `navigate_to("B05")`，机器人执行过程中可以产生 `COMMAND_ACCEPTED`、`NAVIGATION_STARTED`、`NAVIGATION_SUCCEEDED`。Java 收到最终成功事实后，先把 C201 更新为 `SUCCEEDED`，再刷新 ExecutionContext；如果 `VISIT B05` 尚未完成，就把结果继续交给动作 Agent，如果整体条件已经满足，才推进 PlanStep。
+把代码翻译成人话就是：
 
-Tool Result 表示一次 MCP 调用返回的结果；RobotEvent 表示机器人实际执行过程中产生的事实。如果 Tool 一直等到动作完成才返回，成功结果可以帮助更新 Command；如果只返回 `accepted`，Java 只能把它当作 ACK，必须等待完成 Event 或状态回调，不能立即把 Command、Step 标成 `SUCCEEDED`。
+1. 用 eventId 防止同一个反馈被重复处理；
+2. 用 commandId 找到这次反馈属于哪一次 Tool Calling；
+3. 校验 robotId，确认反馈来自目标机器人；
+4. 根据 Event 更新 RobotCommand 的当前状态；
+5. 调用 `taskExecutionService.onCommandUpdated(stepId)`，让 Java 重新判断当前 Step。
+
+~~~text
+RobotEvent
+↓ Java 更新 RobotCommand
+TaskExecutionService 重新判断当前 Step
+├─ 已完成 → Step SUCCEEDED → 下一 Step
+├─ 需要等待 → WAITING_INTERACTION
+└─ 未完成 → 构造新 ExecutionContext → 再调用动作 Agent
+~~~
+
+`onCommandUpdated(stepId)` 不是“把 Event 直接发给动作 Agent”，而是通知 Java：某条 Command 的状态已经变化，请重新评估这个 Step。只有 Step 尚未完成且还需要机器人继续执行时，Java 才构造新的 ExecutionContext 再调用动作 Agent。动作 Agent 看到的是最新执行上下文和结果摘要，不直接消费 RobotEvent 表。
+
+两个 ID 只需记住：
+
+~~~text
+commandId = 找到这个 Event 属于哪次 Tool Calling
+eventId   = 判断这个反馈本身是否已经处理过
+~~~
 
 数据库锁只保护短事务，不在网络请求期间持有。Java ToolCallback 先持久化本次 Tool Calling 的 RobotCommand，再在事务提交后执行网络调用；Tool Result 或异步 RobotEvent 使用新事务更新记录和状态。
 
@@ -241,7 +338,7 @@ commandId 由中央 Java 平台为每次副作用调用生成，用于归属 Ste
 3. 仍不确定则暂停 Step 并人工接管；
 4. 不能换新 ID 盲目重试移动或动作。
 
-RobotEvent 仍由 1.4 节的事件处理器落库，并作为 Java 状态机输入：先更新 RobotCommand，再更新 ExecutionContext；Step 未完成时把最新结果继续交给动作 Agent，整体条件满足时才把 PlanStep 标记成功并推进下一步。
+RobotEvent 仍由 1.4 节的处理器落库：Java 先更新 RobotCommand，再由 TaskExecutionService 重新评估 Step。只有 Step 未完成且还需要继续执行时，Java 才构造新的 ExecutionContext 调用动作 Agent；整体条件满足时由 Java 把 PlanStep 标记成功并推进下一步。
 
 接管时 Task 进入 PAUSED_MANUAL，Java 停止产生新命令并请求机器人停止/取消。进程退出和网络断开都不能证明机器人已安全停止，必须等待设备状态或现场确认。
 
@@ -253,12 +350,13 @@ Plan              人工审核后的业务路线
 PlanStep          一个业务阶段，例如 VISIT A03
 Tool Call         动作 Agent 对 bot_mind 真实机器人能力的调用
 RobotCommand      中央平台对一次副作用 Tool Calling 保存的执行记录
-RobotEvent        机器人实际执行事实，也是 Java 状态机输入
+RobotEvent        机器人对某次 RobotCommand 的异步执行反馈
 commandId         标识同一次命令，支撑幂等、追踪与 UNKNOWN 对账
+eventId           标识一次反馈，防止同一 Event 被重复处理
 UNKNOWN           表示结果暂时无法确认
 ~~~
 
-Java 是任务事实中心；机器人负责执行并回报。正常链路和异常恢复使用同一组 Command、Event 与状态机，而不是两套互不相干的流程。
+Java 是任务事实中心；机器人负责执行并回报。同步 Tool Result 和异步 RobotEvent 都先更新 RobotCommand，再由同一套 TaskExecutionService 规则重新判断 Step。
 
 ---
 
@@ -506,7 +604,12 @@ RobotController
                                ↓
                           Unitree SDK
   ↓ Tool Result / RobotEvent
-Java 状态机更新 Command / Step / Task
+Java 更新 RobotCommand
+  ↓
+TaskExecutionService 重新判断 PlanStep
+  ├─ 未完成：新 ExecutionContext → 动作 Agent 继续
+  ├─ 需要等待：WAITING_INTERACTION
+  └─ 已完成：Step SUCCEEDED → 下一 Step
 ```
 
 ## 3.2 G1ControlServer 与 RobotController
@@ -707,7 +810,7 @@ TaskExecutionService 只负责查询当前正式 Step、判断是否允许开始
 
 ### 4.8.2 ExecutionContext
 
-TaskExecutionService 从当前 Task、正式 Plan、PlanStep、Robot 状态和最近 Command/Event 临时组装只读上下文，不要求新增数据库表：
+TaskExecutionService 从当前 Task、正式 Plan、PlanStep、Robot 状态、RobotCommand 当前状态和 Java 整理后的结果摘要临时组装只读上下文，不要求新增数据库表。RobotEvent 先由 Java 归并到 Command 和结果摘要，不会原样交给动作 Agent：
 
 ```java
 public record ExecutionContext(
@@ -801,9 +904,9 @@ PlanStep S2：VISIT B05
 
 Java ToolCallback / MCP Client 在这个受控调用边界完成 robotId 绑定、权限检查、参数校验、commandId 生成、RobotCommand 记录和真实 `tools/call`。这些是同一次 Tool Calling 的门禁与留痕，不是“Tool → Command → Tool”的转换。
 
-Tool Result 与 RobotEvent 也不能混为一谈。Tool Result 是 MCP 调用的返回值；RobotEvent 是机器人执行过程中的事实。短动作可以在最终 Tool Result 返回后更新 Command，长耗时动作如果只返回 `accepted`，还必须等待 `NAVIGATION_SUCCEEDED` 等 Event，ACK 不能直接把 Command 或 Step 标成成功。
+Tool Result 与 RobotEvent 也不能混为一谈。Tool Result 是本次 MCP 调用的同步返回值；RobotEvent 是机器人对该 RobotCommand 的后续异步执行反馈。短动作可以在最终 Tool Result 返回后直接更新 Command；长耗时动作如果只返回 `accepted`，还必须等待 `SUCCEEDED`、`FAILED` 或 `CANCELED` Event（或等价状态回调），ACK 不能直接把 Command 或 Step 标成成功。
 
-动作 Agent 可以观察最新结果后继续选择下一个 Tool，形成受工具白名单、最大调用次数、超时和当前 Step 边界约束的“观察—调用—再观察”循环。
+动作 Agent 可以观察 Java 重新构造的最新 ExecutionContext 后继续选择下一个 Tool，形成受工具白名单、最大调用次数、超时和当前 Step 边界约束的“观察—调用—再观察”循环。它不直接订阅或消费 RobotEvent。
 
 ### 4.8.4 普通 PlanStep 怎样执行
 
@@ -885,7 +988,10 @@ S2 = VISIT B05（下一步）
 → tool_call：navigate_to("B05")
 ├─ 伴随记录 RobotCommand C201
 └─ MCP tools/call → R1 bot_mind
-→ Tool Result / RobotEvent：导航完成
+→ 最终 Tool Result，或异步 RobotEvent：SUCCEEDED
+→ Java 更新 C201
+→ TaskExecutionService 重新判断 S2
+→ S2 尚未完成，Java 构造新的 ExecutionContext
 → 动作 Agent 根据 temporaryInstruction 不调用 booth_show
 → 返回“需要等待现场交互”
 → Java 将 S2 更新为 WAITING_INTERACTION
@@ -899,13 +1005,14 @@ Java 确认 T100 / S2 / R1 / B05 仍匹配当前活动 Step
 → 动作 Agent tool_call：booth_show("开始讲解展台")
 ├─ 伴随记录 RobotCommand C202
 └─ MCP tools/call → R1 bot_mind
-→ Tool Result / RobotEvent：讲解完成
-→ Java 校验 VISIT B05 整体完成条件
-→ S2 → SUCCEEDED
+→ 最终 Tool Result，或异步 RobotEvent：SUCCEEDED
+→ Java 更新 C202
+→ TaskExecutionService 重新判断 S2
+→ VISIT B05 整体完成条件满足，S2 → SUCCEEDED
 → TaskExecutionService 推进下一正式 Step
 ```
 
-“去下一站”的目标 Step 由 Java 根据正式 Plan 确定；“到了先别讲”的执行方式由动作 Agent 理解并落实。工具失败时，Agent 只能在当前 Step 和策略允许范围内改参、停止或等待，不能改写后续路线；取消与停止仍调用 `stop_robot`、`stop_speaking` 等白名单 Tool，最终状态由 Java 根据结果和 Event 修改。
+“去下一站”的目标 Step 由 Java 根据正式 Plan 确定；“到了先别讲”的执行方式由动作 Agent 理解并落实。工具失败时，Agent 只能在当前 Step 和策略允许范围内改参、停止或等待，不能改写后续路线；取消与停止仍调用 `stop_robot`、`stop_speaking` 等白名单 Tool。最终 Tool Result 或异步 RobotEvent 都先更新 Command，再由 Java 重新判断 Step。
 
 完整心智模型如下：
 
@@ -933,13 +1040,16 @@ bot_mind：“真正实现 Tool”
         ↓
 G1 / Nav2 / TTS
         ↓
-Tool Result / RobotEvent：“实际发生了什么”
+最终 Tool Result / 异步 RobotEvent：“执行结果是什么”
         ↓
-Java 状态机：“Step 是否完成？”
+Java 更新 RobotCommand
+        ↓
+TaskExecutionService：“Step 是否完成？”
         ↓
    否              是
    ↓               ↓
-最新上下文给 Agent   下一 Step
+新 ExecutionContext   Step SUCCEEDED
+给动作 Agent          → 下一 Step
 ```
 
 ```text
@@ -948,7 +1058,7 @@ Java                 → 决定现在执行哪个 Step，并维护状态
 动作 Agent           → 决定当前 Step 怎么调用机器人 Tools
 bot_mind             → 定义并执行机器人能力
 RobotCommand         → 一次副作用 Tool Calling 的执行记录
-RobotEvent           → 机器人实际执行事实，也是 Java 状态机输入
+RobotEvent           → 机器人对某次 RobotCommand 的异步执行反馈
 ```
 
 面试时应如实表达：“动作 Agent 不是我主责开发的模块，但因为它与我负责的中央平台和 G1 执行模块直接协作，我后续系统梳理过它的 Tool Calling 和 ExecutionContext 机制。”
@@ -964,7 +1074,7 @@ RobotCommand：伴随副作用 Tool Calling 保存的执行记录
 G1 执行层：真正执行技能并保障硬件安全
 ~~~
 
-ChatMemory 管“之前聊过什么”，请求级 QaTools 管“当前允许查什么”；模型负责语义判断和动态工具编排，Java 负责范围、权限、参数、证据、Command/Event 和副作用校验。
+ChatMemory 管“之前聊过什么”，请求级 QaTools 管“当前允许查什么”；模型负责语义判断和动态工具编排，Java 负责范围、权限、参数、证据、Command 状态、异步 Event 处理和副作用校验。
 
 ---
 
@@ -976,11 +1086,33 @@ ChatMemory 管“之前聊过什么”，请求级 QaTools 管“当前允许查
 
 ### Q1：Step、Tool、Command、Event 分别是什么？
 
-**推荐回答：** PlanStep 是 `VISIT B05` 这样的业务目标。Java 先确定当前 Step 并构造 ExecutionContext，动作 Agent 再选择 bot_mind Tool。每次有副作用的 Tool Calling 都伴随一条 RobotCommand，用来追踪和恢复；RobotEvent 则记录机器人实际执行事实。Command 是 Tool 调用记录，不是把 Step 再翻译成另一套机器人协议。
+**推荐回答：** PlanStep 是 `VISIT B05` 这样的业务目标；Tool 是机器人真正提供的能力；RobotCommand 记录这次调用了哪个有副作用的 Tool 以及当前状态；RobotEvent 是机器人对某次 RobotCommand 的异步执行反馈。Java 根据 Tool Result 或 Event 更新 Command，再判断当前 Step 是否完成。
 
-**追问：** RobotEvent 只是日志吗？不是，它也是 Java 状态机输入；Java 用 Event 更新 Command，再判断 Step 是否完成。延迟旧事件还要检查 commandId、当前状态和合法转换。
+**一句话记忆：** Step 是目标，Tool 是能力，Command 记当前调用，Event 是异步反馈。
 
-**一句话记忆：** Step 是目标，Tool 是能力，Command 是调用记录，Event 是事实。
+#### 追问：RobotEvent 是什么？
+
+**推荐回答：** RobotEvent 是机器人对某次 RobotCommand 的异步执行反馈。比如导航 Tool 已经发出后，机器人稍后回报导航成功或失败。Java 根据 Event 更新 Command，再判断当前 PlanStep 是否完成。
+
+**一句话记忆：** Event 是机器人异步执行反馈。
+
+#### 追问：Command 已经有 status，为什么还要 Event？
+
+**推荐回答：** `Command.status` 表示当前状态，Event 表示机器人实际回报过哪些执行阶段。对长耗时动作，Tool 可能只先返回 `accepted`，真正完成要靠后续 Event 或状态回调确认。
+
+**一句话记忆：** Command 看现在，Event 记过程。
+
+#### 追问：Event 只是日志吗？
+
+**推荐回答：** 不是。它既可以记录异步执行反馈，也会作为 Java 更新 Command 和重新判断 Step 的输入，但不需要把它设计成复杂事件溯源系统。
+
+**一句话记忆：** Event 能留痕，也能推动 Java 重评估状态。
+
+#### 追问：onCommandUpdated 是发给动作 Agent 吗？
+
+**推荐回答：** 不是。它先触发 Java 重新评估当前 Step。只有 Step 还没完成且需要继续执行时，Java 才重新构造 ExecutionContext，再调用动作 Agent。
+
+**一句话记忆：** 先由 Java 判断 Step，再决定是否继续调用 Agent。
 
 ## 5.2 Planning Agent 高频问题
 
@@ -1108,7 +1240,7 @@ ChatMemory 管“之前聊过什么”，请求级 QaTools 管“当前允许查
 
 ### Q16：动作 Agent 到底负责什么？
 
-**推荐回答：** Planning Agent 决定机器人和展台路线，PlanStep 用 `type + targetCode` 保存 `VISIT A03` 这样的业务目标。动作 Agent 读取 Java 给出的 type、targetCode 和 ExecutionContext：type 限定要完成的业务，targetCode 固定目标，机器人状态、执行阶段和临时要求决定下一次调用哪个 bot_mind Tool。Java 记录 Command/Event 并推进状态，bot_mind 和 G1 执行具体技能。
+**推荐回答：** Planning Agent 决定机器人和展台路线，PlanStep 用 `type + targetCode` 保存 `VISIT A03` 这样的业务目标。动作 Agent 读取 Java 给出的 type、targetCode 和 ExecutionContext：type 限定要完成的业务，targetCode 固定目标，机器人状态、执行阶段和临时要求决定下一次调用哪个 bot_mind Tool。Java 保存 Command 当前状态、处理异步 Event 并重新判断 Step，bot_mind 和 G1 执行具体技能。
 
 **追问：** 谁决定当前执行哪个 Step？TaskExecutionService 根据正式 Plan 决定。动作 Agent 直接选择白名单 MCP Tools，但不能猜下一 Step、修改业务状态或绕过 Tool 门禁访问 ROS2、SDK、Shell。
 
@@ -1142,11 +1274,11 @@ ChatMemory 管“之前聊过什么”，请求级 QaTools 管“当前允许查
 
 ## 5.7 一分钟项目介绍
 
-我参与的是一个多机器人具身智能展厅项目，主要负责 Spring Boot 中央调度平台、中央规划 Agent，以及 G1 动作编排与执行模块。Planning Agent 基于 Java 准备的候选事实生成机器人和路线草案，经 Validator、有限 Reviser 和人工审核后原子分配机器人。执行时 Java 根据正式 Plan 选择当前业务 Step，并提供 ExecutionContext；动作 Agent 通过 Spring AI Tool Calling 直接编排目标机器人 bot_mind 暴露的导航、讲解和动作能力。平台对每次有副作用的 Tool Calling 保存 RobotCommand，通过 Tool Result 和 RobotEvent 跟踪真实结果，再由 Java 判断 Step 是否完成。执行侧还使用 commandId、UNKNOWN 对账和人工接管处理不确定结果；动作 Agent 属于我为理解完整系统梳理的 V2 深化设计，不是我主责开发的模块。
+我参与的是一个多机器人具身智能展厅项目，主要负责 Spring Boot 中央调度平台、中央规划 Agent，以及 G1 动作编排与执行模块。Planning Agent 基于 Java 准备的候选事实生成机器人和路线草案，经 Validator、有限 Reviser 和人工审核后原子分配机器人。执行时 Java 根据正式 Plan 选择当前业务 Step，并提供 ExecutionContext；动作 Agent 通过 Spring AI Tool Calling 直接编排目标机器人 bot_mind 暴露的导航、讲解和动作能力。平台对每次有副作用的 Tool Calling 保存 RobotCommand：最终 Tool Result 可以直接更新 Command，长耗时调用则由 RobotEvent 异步反馈结果；随后 TaskExecutionService 重新判断 Step 是否完成。执行侧还使用 commandId、UNKNOWN 对账和人工接管处理不确定结果；动作 Agent 属于我为理解完整系统梳理的 V2 深化设计，不是我主责开发的模块。
 
 ## 5.8 三分钟项目介绍
 
-项目要解决的是两台机器人同时承担展厅接待时，中央平台怎样把自然语言需求变成计划，并可靠推进导航、讲解和动作。Java 平台采用模块化单体和 PostgreSQL，以 Task 表示一次接待，以审核后的 Plan 和 PlanStep 表示业务顺序。Tool 是 bot_mind 真正提供的机器人能力；RobotCommand 是中央平台对一次副作用 Tool Calling 保存的执行记录；RobotEvent 是执行事实和 Java 状态机输入。LLM 不直接改业务状态。
+项目要解决的是两台机器人同时承担展厅接待时，中央平台怎样把自然语言需求变成计划，并可靠推进导航、讲解和动作。Java 平台采用模块化单体和 PostgreSQL，以 Task 表示一次接待，以审核后的 Plan 和 PlanStep 表示业务顺序。Tool 是 bot_mind 真正提供的机器人能力；RobotCommand 是中央平台对一次副作用 Tool Calling 保存的执行记录和当前状态快照；RobotEvent 是机器人对某次 RobotCommand 的异步执行反馈。LLM 不直接改业务状态。
 
 规划部分采用“Java 管硬约束、LLM 管语义偏好、Java 再校验”。Java 先筛出 ONLINE、IDLE、区域和能力满足的机器人以及开放展台，组成 PlanEvidence。模型可按需查询展台主题等规划知识，输出建议机器人和路线的 PlanDraft。Schema 与 Bean Validation 保证格式能读，业务 Validator 检查候选、重复、mustVisit、avoid 和证据 ID。第一次不合法时把错误交给 Reviser，总共最多三次模型尝试；随后仍需人工审核。下发时再次查询最新状态，并用条件 UPDATE 原子完成 IDLE 到 ASSIGNED，失败显式返回 ASSIGN_CONFLICT。
 
