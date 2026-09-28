@@ -145,6 +145,8 @@ PlanStep S3：VISIT A03
 └─ tool_call：booth_show("开始讲解展台") → RobotCommand C103
 ```
 
+`NAVIGATE`、`SPEAK`、`WAVE`、`PLAY_ACTION`、`TTS` 描述的是机器人能力或实现方式，不是当前 V2 的 StepType。同一个 `VISIT` 可能使用导航、挥手和讲解多个 Tool；如果把这些能力名提升为业务 Step 类型，正式 Plan 就会与 bot_mind 的具体实现耦合。
+
 因此 `PlanStep 1 ─ n RobotCommand` 表达的是：完成一个业务 Step 的过程中发生了多次具有副作用的机器人 Tool Calling。Tool 是 bot_mind 真正提供的能力；Command 是中央平台对调用的执行记录。C101、C102 成功只说明导航和挥手完成；只有 `VISIT A03` 的整体完成条件满足，Java 才能把 S3 标记为 `SUCCEEDED`。
 
 
@@ -741,6 +743,26 @@ public record ExecutionContext(
 2. `targetCode` 提供 Java 已确认的固定业务目标，Agent 不能自行换站；
 3. `currentRobotState`、`executionPhase`、`temporaryInstruction` 等上下文决定现在应该调用哪个 Tool、等待还是结束本 Step。
 
+Agent 不是只看到一个 `"VISIT"` 字符串后自由猜测。Java 会同时提供 ExecutionContext、目标机器人的 Tool Schema，并在系统提示中预先定义 StepType 语义和完成目标，例如：
+
+```text
+你只能围绕当前 ExecutionContext 完成当前 PlanStep：
+
+VISIT：在 targetCode 指定展台完成一次接待。
+通常需要到达目标，并完成该站讲解或接待流程。
+可以按 temporaryInstruction 调整 Tool 顺序，但不得改变 targetCode。
+
+RETURN：返回 targetCode 指定位置。
+确认到达该位置后，可以报告当前 Step 已完成。
+
+WAIT：暂停推进当前业务流程，等待时间条件或新的现场指令。
+不得自行选择或推进下一个正式 PlanStep，也不存在必须调用的 wait Tool。
+
+END：不再发起新的机器人业务动作，返回收尾结果，由 Java 完成 Task 收尾。
+
+Tool Result 只说明某次能力调用的结果；不得自行修改 PlanStep 状态。
+```
+
 ```text
 VISIT + A03
 ├─ 尚未到站                         → navigate_to("A03")
@@ -753,6 +775,8 @@ END + targetCode=null               → 不调用机器人业务 Tool，由 Java
 ```
 
 这不是把 `type` 硬编码成唯一 Tool：`VISIT` 可能因为现场要求增加 `play_named_action`，也可能在到站后先等待。但 Java ToolCallback 仍要校验 Tool 与当前 Step 是否相容，例如 `RETURN LOBBY` 的 `navigate_to` 参数不能被模型改成未授权点位。
+
+完成条件也不能只看 Tool 名字。`navigate_to("A03") → SUCCEEDED` 只证明机器人已到达 A03；如果 `VISIT A03` 还要求完成该站讲解或接待，Java 不能把 Step 标成成功。对于只要求回到指定位置的 `RETURN HOME`，关联 HOME 的最终导航成功结果则可能已经满足整个 Step。**Tool Result 表示一次机器人能力调用结果；PlanStep 是否完成，要按 StepType 的业务完成条件由 Java 状态机最终判断。**
 
 ### 4.8.3 Agent 直接 Tool Calling
 
@@ -809,6 +833,34 @@ tool_call：booth_show("开始讲解展台")
 ```
 
 这里没有另一条“普通流程执行器”。动作 Agent 统一选择机器人 Tool；Java 只决定当前 Step、提供上下文、接收结果并推进状态。
+
+如果同一个 Step 带有临时要求：
+
+```text
+stepType = VISIT
+targetCode = A03
+temporaryInstruction = "到了以后先别讲，先挥个手"
+
+动作 Agent：
+navigate_to("A03")
+→ 等待导航完成
+→ play_named_action("wave")
+→ 返回“等待用户继续”，暂不调用 booth_show
+
+Java：
+S3.type 仍为 VISIT
+S3.status → WAITING_INTERACTION
+
+用户说“开始讲”
+→ Java 校验当前仍是 T100 / S3 / R1 / A03
+→ 重新构造 ExecutionContext
+→ 动作 Agent 调用 booth_show(...)
+→ 讲解完成
+→ Java 校验 VISIT 整体完成条件
+→ S3.status → SUCCEEDED
+```
+
+临时自然语言要求只改变当前 Step 的 Tool 调用方式，不改变 `PlanStep.type`、`targetCode` 或正式路线。
 
 ### 4.8.5 “下一站，但是到了先别讲”怎样执行
 
