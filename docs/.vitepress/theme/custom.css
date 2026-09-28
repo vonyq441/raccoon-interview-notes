@@ -98,6 +98,137 @@ html.eye-care ::selection {
   flex: 0 0 auto;
 }
 
+/* 长文档滚动时，目录会自动把当前标题带回可视区域，也允许用户手动滚动。 */
+.VPDoc .aside-container {
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
+}
+
+.VPDoc .aside-container:hover {
+  scrollbar-color: var(--vp-c-divider) transparent;
+}
+
+.VPDoc .aside-container::-webkit-scrollbar {
+  display: block;
+  width: 6px;
+}
+
+.VPDoc .aside-container::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: transparent;
+}
+
+.VPDoc .aside-container:hover::-webkit-scrollbar-thumb {
+  background: var(--vp-c-divider);
+}
+
+.sidebar-collapse-toggle {
+  display: none;
+}
+
+@media (min-width: 960px) {
+  .sidebar-collapse-toggle {
+    position: fixed;
+    top: calc(var(--vp-nav-height) + 12px);
+    left: calc(var(--vp-sidebar-width) - 102px);
+    z-index: 40;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 86px;
+    height: 32px;
+    padding: 0 10px;
+    border: 1px solid var(--vp-c-divider);
+    border-radius: 8px;
+    background: color-mix(in srgb, var(--vp-sidebar-bg-color) 92%, transparent);
+    box-shadow: var(--vp-shadow-1);
+    color: var(--vp-c-text-2);
+    font: inherit;
+    font-size: 12px;
+    font-weight: 600;
+    line-height: 1;
+    cursor: pointer;
+    backdrop-filter: blur(8px);
+    transition:
+      left 0.25s ease,
+      color 0.2s,
+      border-color 0.2s,
+      background-color 0.2s;
+  }
+
+  .sidebar-collapse-toggle:hover,
+  .sidebar-collapse-toggle:focus-visible {
+    border-color: var(--vp-c-brand-1);
+    background: var(--vp-c-brand-soft);
+    color: var(--vp-c-brand-1);
+  }
+
+  .sidebar-collapse-toggle:focus-visible {
+    outline: 2px solid var(--vp-c-brand-1);
+    outline-offset: 2px;
+  }
+
+  .VPSidebar,
+  .VPContent.has-sidebar,
+  .VPNavBar.has-sidebar .title,
+  .VPNavBar.has-sidebar .content,
+  .VPNavBar.has-sidebar .divider,
+  .VPLocalNav.has-sidebar {
+    transition:
+      opacity 0.2s ease,
+      transform 0.25s ease,
+      padding-left 0.25s ease;
+  }
+
+  html.sidebar-collapsed .VPSidebar {
+    visibility: hidden;
+    opacity: 0;
+    pointer-events: none;
+    transform: translateX(-100%);
+  }
+
+  html.sidebar-collapsed .VPContent.has-sidebar,
+  html.sidebar-collapsed .VPLocalNav.has-sidebar,
+  html.sidebar-collapsed .VPNavBar.has-sidebar .divider {
+    padding-left: 0;
+  }
+
+  html.sidebar-collapsed .VPNavBar.has-sidebar .title {
+    visibility: hidden;
+    opacity: 0;
+    pointer-events: none;
+    transform: translateX(-100%);
+  }
+
+  html.sidebar-collapsed .VPNavBar.has-sidebar .content {
+    padding-left: 32px;
+  }
+
+  html.sidebar-collapsed .sidebar-collapse-toggle {
+    left: 12px;
+  }
+}
+
+@media (min-width: 1440px) {
+  .sidebar-collapse-toggle {
+    left: calc((100vw - (var(--vp-layout-max-width) - 64px)) / 2 + var(--vp-sidebar-width) - 134px);
+  }
+
+  html.sidebar-collapsed .VPContent.has-sidebar {
+    padding-left: calc((100vw - var(--vp-layout-max-width)) / 2);
+  }
+
+  html.sidebar-collapsed .VPNavBar.has-sidebar .content {
+    padding-left: calc((100vw - var(--vp-layout-max-width)) / 2 + 32px);
+  }
+
+  html.sidebar-collapsed .VPLocalNav.has-sidebar,
+  html.sidebar-collapsed .VPNavBar.has-sidebar .divider {
+    padding-left: calc((100vw - var(--vp-layout-max-width)) / 2);
+  }
+}
+
 html {
   -webkit-text-size-adjust: 100%;
   scroll-padding-top: calc(var(--vp-nav-height) + env(safe-area-inset-top) + 12px);

@@ -12,7 +12,7 @@ export default defineConfig({
     ['meta', { name: 'apple-mobile-web-app-capable', content: 'yes' }],
     ['meta', { name: 'apple-mobile-web-app-status-bar-style', content: 'default' }],
     ['meta', { name: 'format-detection', content: 'telephone=no' }],
-    ['script', {}, `(function(){try{if(localStorage.getItem('raccoon-docs-eye-care')==='1'){document.documentElement.classList.add('eye-care')}}catch(e){}})();`]
+    ['script', {}, `(function(){try{if(localStorage.getItem('raccoon-docs-eye-care')==='1'){document.documentElement.classList.add('eye-care')}if(localStorage.getItem('raccoon-docs-sidebar-collapsed')==='1'){document.documentElement.classList.add('sidebar-collapsed')}}catch(e){}})();`]
   ],
   themeConfig: {
     logo: '/logo.svg',
