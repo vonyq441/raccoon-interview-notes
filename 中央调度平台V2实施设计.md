@@ -107,12 +107,100 @@ Step 完成
 
 | 对象 | 一句话解释 | 典型字段 |
 |---|---|---|
-| Robot | 一台可被分配的机器人及其最新业务状态 | robotId, onlineStatus, workStatus, areaCode |
+| Robot | 一台可被分配的机器人及其最新运行快照、业务状态 | robotId, onlineStatus, workStatus, areaCode, lastSeenAt, controlFresh, runtimeActivity, currentWaypoint |
 | Task | 一批访客的一次完整接待任务 | taskId, requirement, status, assignedRobotId |
 | Plan | Task 经人工审核后的执行路线 | planId, taskId, version, status |
 | PlanStep | 一个业务阶段，例如 `VISIT A03`；不展开机器人内部每个动作 | stepId, type, targetCode, sequence, status |
 | RobotCommand | 一次有副作用的机器人 Tool Calling 的持久化记录及当前状态快照 | commandId, taskId, stepId, robotId, toolName, payload, status |
 | RobotEvent | 机器人对某次 RobotCommand 的异步执行反馈 | eventId, commandId, type, occurredAt |
+
+### Robot 状态快照：Java 主动轮询固定 IP
+
+当前 `bot_mind` 已通过 HTTP JSON-RPC 暴露 MCP `ping`、`get_robot_state` 和 `get_current_waypoint`，但没有主动向中央平台推送心跳、开机快照或位置事件。因此 V2 按现有接口采用 **Java 主动拉取、Java 维护状态快照** 的方案，不把尚未实现的机器人主动上报写成现状。
+
+```text
+Java 定时读取 robot_registry 中已启用的固定 IP
+↓
+向每台机器人发送 MCP ping
+├─ 失败：本轮不更新 lastSeenAt
+│        保留上一次快照并记录失败日志
+│
+└─ 成功：
+   ├─ tools/call get_robot_state
+   └─ tools/call get_current_waypoint
+        ↓
+   Java 校验响应并更新自己的 Robot 状态快照
+
+后台超时检查
+↓
+now - lastSeenAt > offlineTimeout
+↓
+Java 将机器人判定为 OFFLINE
+```
+
+三个状态不能混成一个 `status` 字段：
+
+| 判断 | 数据来源 | 表示什么 |
+|---|---|---|
+| 中央平台是否取得有效快照 | 完整 MCP 轮询与 `lastSeenAt` | 固定 IP 上的 Python 服务、网络和只读状态接口是否整体可用 |
+| 机器人控制层是否健康 | `get_robot_state` 中 g1_base 的 `fresh`、activity、navigation_manager | ROS2/G1 控制状态是否仍在更新、当前是否执行动作 |
+| 业务上是否可分配 | Java 的 `workStatus`、`currentTaskId` | 是否已经被其他接待任务占用 |
+
+`ping` 成功不等于机器人一定可执行导航；只有 `lastSeenAt` 未过期、g1_base 状态新鲜、控制活动允许接单，而且 Java 业务状态为 `IDLE`，才可以进入 Planning Agent 的候选集。
+
+`get_current_waypoint` 根据机器人本地 TF 位姿与已配置点位的距离返回展台名。返回 `waypointName = null` 可能只是机器人位于两个展台之间，不能据此判断机器人离线；区域信息可以由固定配置和点位映射确定。Java 使用服务端接收时间更新 `lastSeenAt`，不依赖机器人本地时钟。
+
+最小轮询代码可以写成：
+
+```java
+@Component
+@RequiredArgsConstructor
+public class RobotStatusPoller {
+    private final RobotRegistryRepository registryRepository;
+    private final RobotGateway robotGateway;
+    private final RobotSnapshotService snapshotService;
+    private final Clock clock;
+
+    // 示例为 5 秒；真实值通过配置和展厅网络情况确定。
+    @Scheduled(fixedDelayString = "${robot.poll.interval-ms:5000}")
+    public void pollEnabledRobots() {
+        for (RobotEndpoint endpoint : registryRepository.findAllEnabled()) {
+            pollOne(endpoint);
+        }
+    }
+
+    private void pollOne(RobotEndpoint endpoint) {
+        try {
+            // ping 只证明 bot_mind 可达，不能替代底层健康检查。
+            robotGateway.ping(endpoint);
+            RobotRuntimeState state = robotGateway.getRobotState(endpoint);
+            CurrentWaypoint waypoint = robotGateway.getCurrentWaypoint(endpoint);
+
+            // 只有取得并校验本轮快照后才推进 lastSeenAt。
+            snapshotService.applySuccessfulPoll(
+                endpoint.robotId(), state, waypoint, clock.instant());
+        } catch (RobotGatewayException ex) {
+            // 失败时不能用当前时间刷新 lastSeenAt，否则关机机器人会永远在线。
+            // 保留旧快照，等待超时任务把它判定为 OFFLINE。
+            snapshotService.recordPollFailure(endpoint.robotId(), ex.getErrorCode());
+        }
+    }
+}
+```
+
+离线判断独立于某一次瞬时失败，避免一次 Wi-Fi 抖动就上下线翻转：
+
+```java
+@Scheduled(fixedDelayString = "${robot.offline-check.interval-ms:5000}")
+public void markTimedOutRobotsOffline() {
+    Instant deadline = clock.instant().minus(offlineTimeout);
+    robotRepository.markOfflineWhereLastSeenBefore(deadline);
+}
+```
+
+例如可以从“5 秒轮询、15 秒未成功同步判离线”开始联调，但这只是可配置初值。规划查询仍要直接检查 `lastSeenAt >= onlineDeadline`，不能只相信可能尚未被后台任务刷新的 `onlineStatus` 字段。
+
+多机器人场景中，每个 endpoint 必须配置较短的连接与读取超时，并使用有界线程池并发轮询，避免一台断网机器人阻塞后续机器人；有界并发只优化轮询时延，不改变上述状态语义。
 
 ### PlanStep.type：业务步骤类型
 
@@ -402,7 +490,9 @@ Java 擅长在线、空闲、区域、能力、展台开放、mustVisit、avoid�
 ```text
 规划请求
   ↓
-Java 查询并过滤可用机器人、开放展台
+Java 从定时轮询形成的最新快照中查询机器人，并过滤开放展台
+  ├─ 无合法机器人：返回 NO_AVAILABLE_ROBOT，不调用模型
+  └─ 存在合法机器人：构造 PlanEvidence
   ↓
 PlanEvidence
   ↓
@@ -442,7 +532,21 @@ public record RobotCandidate(
 ) {}
 ```
 
-Java 先过滤 ONLINE + IDLE + 区域允许 + 能力满足，只把合法候选交给模型。Planning Agent 不自己查数据库判断机器人状态：这是强一致事实，Java 直接查询更快、更稳定，也不会让模型漏查。
+Java 按下面的硬条件先过滤，只把合法候选交给模型：
+
+```text
+lastSeenAt 未超过离线阈值
++ onlineStatus = ONLINE
++ controlFresh = true
++ runtimeActivity 允许接单
++ workStatus = IDLE
++ 区域允许
++ 能力满足
+```
+
+其中 `lastSeenAt`、`controlFresh`、`runtimeActivity` 和 `currentWaypoint` 来自 Java 对固定 IP `bot_mind` 的定时 MCP 轮询；`workStatus` 和 `currentTaskId` 是 Java 自己维护的业务事实。Planning Agent 不再通过 Tool 重复查询这些状态：它们是每次规划都必须检查的强约束，直接由 Java 查询更快、更稳定，也避免模型漏查、少查或在多轮 Tool Calling 中混用不同时间的快照。
+
+如果候选集合为空，例如两台机器人都已离线，本次请求直接返回 `NO_AVAILABLE_ROBOT`，不把空候选交给模型，也不允许模型虚构 robotId。Task 保持未执行状态，前端显示最近一次成功同步时间；机器人恢复并完成新一轮轮询后，工作人员可以重新发起规划。
 
 ## 2.4 Planning Tool：只补充语义信息
 
@@ -538,7 +642,7 @@ for (int attempt = 1; attempt <= 3; attempt++) {
 return draftRepository.saveNeedsHumanReview(request, violations);
 ```
 
-调用顺序是 Attempt 1 使用 Planner，Attempt 2 和 Attempt 3 才是 Reviser；最多 3 次模型尝试。首次合法立即结束；候选为空、mustVisit 与 avoid 冲突等明确无解情况直接人工处理。
+调用顺序是 Attempt 1 使用 Planner，Attempt 2 和 Attempt 3 才是 Reviser；最多 3 次模型尝试。首次合法立即结束。候选机器人为空时 Java 在模型调用前返回 `NO_AVAILABLE_ROBOT`；mustVisit 与 avoid 冲突等需要业务取舍的无解情况才进入人工处理。
 
 它可称“有限反思式修订”，但不是自由运行的 Reflection Agent：反馈来自确定性 Java Validator，次数有上限，输出不能越过人工审核。
 
@@ -548,6 +652,9 @@ return draftRepository.saveNeedsHumanReview(request, violations);
 
 ```text
 ONLINE？
+lastSeenAt 是否仍在有效窗口内？
+g1_base 状态是否仍然 fresh？
+runtimeActivity 是否允许接单？
 IDLE？
 能力是否满足？
 是否没有其他活动 Task？
@@ -582,6 +689,9 @@ UPDATE robot
 SET work_status = 'ASSIGNED', current_task_id = :taskId
 WHERE robot_id = :robotId
   AND online_status = 'ONLINE'
+  AND last_seen_at >= :onlineDeadline
+  AND control_fresh = TRUE
+  AND runtime_activity = 'IDLE'
   AND work_status = 'IDLE'
   AND area_code = :requiredArea;
 ```
@@ -1195,9 +1305,11 @@ ChatMemory 管“之前聊过什么”，请求级 QaTools 管“当前允许查
 
 **推荐回答：** 它接收 Java 准备的事实，按需查询规划知识，输出结构化可执行草案，经业务 Validator 后有限修订并进入人工审核。模型做语义规划，Java 掌握状态和执行权。
 
-**追问：** 为什么不让模型查机器人在线状态？强一致事实由 Java 直接查更可靠。
+**追问：为什么不让模型通过 Tool 查询机器人在线状态？** 在线、空闲、区域和占用属于每次规划都必须检查的硬约束，不需要模型判断。Java 定时轮询每台已登记固定 IP 的 `bot_mind`：先调用 MCP `ping`，成功后再调用 `get_robot_state` 和 `get_current_waypoint`，据此维护 `lastSeenAt`、控制状态、位置与业务状态快照。规划前 Java 直接过滤出合法候选，Agent 只在候选内结合受众、主题和路线偏好做语义选择，避免漏查、少查或混用不同时间的 Tool 结果。人工下发时 Java 还会重新检查最新快照并用条件更新原子占用机器人，因为规划和下发之间状态可能已经变化。
 
-**一句话记忆：** Agent 规划，Java 决策和执行。
+**追问：机器人断电后，谁把它改成 OFFLINE？** 断电设备无法主动报告离线。轮询失败时 Java 不刷新 `lastSeenAt`；后台超时检查发现 `now - lastSeenAt > offlineTimeout` 后将其标记为 `OFFLINE`。候选查询同时检查 `lastSeenAt`，所以即使状态字段尚未来得及刷新，过期机器人也不会进入候选集。机器人恢复联网并完成一次完整轮询后，Java 才用新快照恢复其在线状态。
+
+**一句话记忆：** Java 管硬事实，Agent 管软偏好；规划前过滤，下发前复查。
 
 ### Q3：JSON 正确但内容错误怎么办？
 
@@ -1349,13 +1461,13 @@ ChatMemory 管“之前聊过什么”，请求级 QaTools 管“当前允许查
 
 ## 5.7 一分钟项目介绍
 
-我参与的是一个多机器人具身智能展厅项目，主要负责 Spring Boot 中央调度平台、中央规划 Agent，以及 G1 动作编排与执行模块。Planning Agent 基于 Java 准备的候选事实生成机器人和路线草案，经 Validator、有限 Reviser 和人工审核后原子分配机器人。执行时 Java 根据正式 Plan 选择当前业务 Step，并提供 ExecutionContext；动作 Agent 通过 Spring AI Tool Calling 直接编排目标机器人 bot_mind 暴露的导航、讲解和动作能力。平台对每次有副作用的 Tool Calling 保存 RobotCommand：同步最终 Tool Result 直接回到当前 Agent Loop，长耗时调用返回 `accepted` 时则暂停，等 RobotEvent 到达后由 Java 更新状态并恢复当前 Step。执行侧还使用 commandId、UNKNOWN 对账和人工接管处理不确定结果；动作 Agent 属于我为理解完整系统梳理的 V2 深化设计，不是我主责开发的模块。
+我参与的是一个多机器人具身智能展厅项目，主要负责 Spring Boot 中央调度平台、中央规划 Agent，以及 G1 动作编排与执行模块。Java 定时轮询每台固定 IP 机器人的 MCP `ping`、`get_robot_state` 和 `get_current_waypoint`，维护可检验的状态快照；Planning Agent 只在 Java 过滤后的合法候选中生成机器人和路线草案，经 Validator、有限 Reviser 和人工审核后原子分配机器人。执行时 Java 根据正式 Plan 选择当前业务 Step，并提供 ExecutionContext；动作 Agent 通过 Spring AI Tool Calling 编排目标机器人 bot_mind 暴露的导航、讲解和动作能力。平台对每次有副作用的 Tool Calling 保存 RobotCommand：同步最终 Tool Result 直接回到当前 Agent Loop，长耗时调用返回 `accepted` 时则暂停，等 RobotEvent 到达后由 Java 更新状态并恢复当前 Step。执行侧还使用 commandId、UNKNOWN 对账和人工接管处理不确定结果；动作 Agent 属于我为理解完整系统梳理的 V2 深化设计，不是我主责开发的模块。
 
 ## 5.8 三分钟项目介绍
 
 项目要解决的是两台机器人同时承担展厅接待时，中央平台怎样把自然语言需求变成计划，并可靠推进导航、讲解和动作。Java 平台采用模块化单体和 PostgreSQL，以 Task 表示一次接待，以审核后的 Plan 和 PlanStep 表示业务顺序。Tool 是 bot_mind 真正提供的机器人能力；RobotCommand 是中央平台对一次副作用 Tool Calling 保存的执行记录和当前状态快照；RobotEvent 是机器人对某次 RobotCommand 的异步执行反馈。LLM 不直接改业务状态。
 
-规划部分采用“Java 管硬约束、LLM 管语义偏好、Java 再校验”。Java 先筛出 ONLINE、IDLE、区域和能力满足的机器人以及开放展台，组成 PlanEvidence。模型可按需查询展台主题等规划知识，输出建议机器人和路线的 PlanDraft。Schema 与 Bean Validation 保证格式能读，业务 Validator 检查候选、重复、mustVisit、avoid 和证据 ID。第一次不合法时把错误交给 Reviser，总共最多三次模型尝试；随后仍需人工审核。下发时再次查询最新状态，并用条件 UPDATE 原子完成 IDLE 到 ASSIGNED，失败显式返回 ASSIGN_CONFLICT。
+规划部分采用“Java 管硬约束、LLM 管语义偏好、Java 再校验”。Java 定时轮询固定 IP 的 `bot_mind`，用 MCP `ping`、`get_robot_state` 和 `get_current_waypoint` 更新 `lastSeenAt`、控制层新鲜度、运行活动和当前位置，再筛出在线未过期、控制健康、业务空闲、区域和能力满足的机器人以及开放展台，组成 PlanEvidence；如果候选为空则直接返回 `NO_AVAILABLE_ROBOT`，不调用模型。模型可按需查询展台主题等规划知识，输出建议机器人和路线的 PlanDraft。Schema 与 Bean Validation 保证格式能读，业务 Validator 检查候选、重复、mustVisit、avoid 和证据 ID。第一次不合法时把错误交给 Reviser，总共最多三次模型尝试；随后仍需人工审核。下发时再次查询最新状态，并用条件 UPDATE 原子完成 IDLE 到 ASSIGNED，失败显式返回 ASSIGN_CONFLICT。
 
 执行方面，TaskExecutionService 根据正式 Plan 确定当前 Step 并构造 ExecutionContext；动作 Agent 直接选择 bot_mind Tool。Java ToolCallback 在同一次调用边界完成权限和参数校验、commandId 与 RobotCommand 留痕以及 MCP 调用。同步最终结果直接续接当前 Agent Tool Loop；只返回 `accepted` 的异步调用会暂停当前 Agent，最终 RobotEvent 到达后由 Java 更新 Command、重新评估 Step，并在需要时用新 ExecutionContext 唤醒 Agent。网络超时进入 UNKNOWN，平台按原 commandId 查询或幂等重试，仍不确定则暂停并人工接管。Outbox 只用于“记录已保存、调用尚未发出时进程崩溃”的恢复，不属于机器人能力模型。G1 侧由 bot_mind 接入 G1ControlServer，RobotController 协调导航和动作，独立 Python Worker 隔离 SDK。
 
@@ -1380,9 +1492,11 @@ ChatMemory 管“之前聊过什么”，请求级 QaTools 管“当前允许查
 固定 IP 解决寻址，不代表身份。robot_registry 保存 robotId、地址、启用状态和凭据摘要；RobotGateway 只访问登记地址，不接受模型提供任意 URL。
 
 - 每台机器人独立 Token，支持停用和轮换；
-- Token 与 robotId 映射，回调也检查两者一致；
-- 请求记录时间戳、commandId 和审计；
+- Token 与 robotId 映射，轮询请求只能发往该机器人登记的 endpoint；未来增加 RobotEvent 回调时也要校验机器人身份；
+- 状态轮询记录请求时间和结果；副作用命令另外记录 commandId 与审计信息；
 - 使用 TLS 时正常校验证书。
+
+当前 `bot_mind` 的 HTTP MCP 接口没有复用中央平台的人员登录会话，因此“每设备 Token、传输加密和凭据轮换”是 V2 接入加固要求，不能写成当前源码已经完整实现。
 
 ## 附录 C：部署
 
@@ -1392,7 +1506,9 @@ Nginx / HTTPS
 Spring Boot 模块化单体
   ├─ PostgreSQL + pgvector
   ├─ 模型、天气、受控联网服务
-  └─ 固定地址 RobotGateway → bot_mind / g1_base
+  └─ RobotStatusPoller / RobotGateway
+       ↓ 固定 IP，MCP ping + tools/call
+     bot_mind → g1_base
 ```
 
 当前规模单机或少量容器即可。配置外置，密钥不入库；数据库备份；外部服务分别设置连接和响应超时。上线前演练 Java 重启、机器人断网、重复事件和结果未知。
@@ -1401,7 +1517,7 @@ Spring Boot 模块化单体
 
 | 表 | 关键字段 | 关键约束 |
 |---|---|---|
-| robot | robot_id, online_status, work_status, area_code, current_task_id | 条件更新完成分配 |
+| robot | robot_id, online_status, work_status, area_code, current_task_id, last_seen_at, control_fresh, runtime_activity, current_waypoint, snapshot_updated_at | 完整轮询更新快照；条件更新完成分配 |
 | task | task_id, requirement, status, assigned_robot_id, version | version 乐观锁 |
 | plan | plan_id, task_id, plan_version, status, approved_by | 一个生效版本 |
 | plan_step | step_id, plan_id, sequence_no, type, target_code, status | plan_id + sequence_no 唯一 |
@@ -1418,6 +1534,8 @@ Spring Boot 模块化单体
 ```sql
 CREATE UNIQUE INDEX uk_event_id ON robot_event(event_id);
 CREATE UNIQUE INDEX uk_plan_step_seq ON plan_step(plan_id, sequence_no);
+CREATE INDEX idx_robot_availability
+  ON robot(online_status, work_status, last_seen_at);
 CREATE INDEX idx_command_timeout ON robot_command(status, updated_at);
 CREATE INDEX idx_allocation_queue
   ON exhibit_allocation(exhibit_code, status, queue_no);
@@ -1446,6 +1564,10 @@ RobotCommand:
 CREATED → QUEUED → SENT → ACKED → RUNNING → SUCCEEDED
                     ├→ REJECTED / UNKNOWN / FAILED / CANCELED
 
+Robot connectivity snapshot:
+ONLINE --超过 offlineTimeout 未成功完整轮询--> OFFLINE
+OFFLINE --ping、状态和位置查询全部成功--> ONLINE
+
 ExhibitAllocation:
 WAITING → RESERVED → OCCUPIED → RELEASED
     └→ CANCELED / EXPIRED
@@ -1455,8 +1577,10 @@ RESERVED → EXPIRED；OCCUPIED → UNKNOWN
 | 错误 | 默认处理 |
 |---|---|
 | 规划 JSON 不能解析 | 反馈 Reviser，受总尝试次数限制 |
+| 没有合法候选机器人 | 返回 NO_AVAILABLE_ROBOT，不调用 Planning Agent |
 | 规划硬约束无解 | NEEDS_HUMAN_REVIEW |
 | 下发时机器人已占用 | ASSIGN_CONFLICT |
+| MCP 状态轮询失败 | 不刷新 lastSeenAt；超过阈值后标记 OFFLINE |
 | 网络超时 | Command → UNKNOWN，按原 commandId 查询 |
 | 机器人安全拒绝 | 不绕过，暂停并展示原因 |
 | 重复 Event | eventId 唯一约束后忽略 |
@@ -1469,7 +1593,10 @@ RESERVED → EXPIRED；OCCUPIED → UNKNOWN
 
 已有机器人代码核对入口：
 
-- `bot_mind/src/mcp/http_transport.py` 与 `src/mcp/service.py`：`tools/list`、`tools/call` 入口和 Tool 分发；
+- `bot_mind/src/mcp/http_transport.py` 与 `src/mcp/service.py`：MCP `ping`、`tools/list`、`tools/call` 入口和 Tool 分发；
+- `bot_mind/src/mcp/tools/get_robot_state.py`：汇总 bot_mind 本地状态与 g1_base 状态的只读 Tool；
+- `bot_mind/src/mcp/tools/get_current_waypoint.py`：读取本地 TF 位姿并匹配最近点位的只读 Tool；
+- `bot_mind/src/service/g1_base_status_client.py` 与 `src/service/pose_provider.py`：g1_base 状态新鲜度和本地位姿缓存；
 - `bot_mind/src/mcp/tools/navigate_to.py`：实际点位导航 Tool `navigate_to`；
 - `bot_mind/src/mcp/tools/booth_show.py`：当前展台讲稿读取与 TTS Tool `booth_show`；
 - `bot_mind/src/mcp/tools/play_named_action.py`：命名动作 Tool `play_named_action`；
