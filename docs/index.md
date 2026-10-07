@@ -10,6 +10,9 @@ hero:
       text: 中央调度平台项目
       link: /central-scheduling
     - theme: alt
+      text: 中央调度快速学习
+      link: /central-scheduling-quickstart
+    - theme: alt
       text: AI Agent 面试学习
       link: /ai-agent-interview
     - theme: alt
