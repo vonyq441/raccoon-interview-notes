@@ -8,7 +8,7 @@
 
 ### 0.1 项目一句话介绍
 
-接待员创建参观任务，中央规划 Agent 建议机器人和路线；工作人员审核后，Java 选择当前 PlanStep 并构造 ExecutionContext，由动作 Agent 直接调用 bot_mind 的导航、讲解和动作 Tools。同步完成的 Tool Result 可以直接回到当前 Agent Tool Calling 循环继续推理；对于长耗时异步操作，Java 根据后续 RobotEvent 更新 Command，并在需要继续当前 Step 时重新构造 ExecutionContext 唤醒动作 Agent。
+接待员创建参观任务，中央规划 Agent 建议机器人和路线；工作人员审核后，Java 选择当前 TaskStep 并构造 ExecutionContext，由动作 Agent 直接调用 bot_mind 的导航、讲解和动作 Tools。同步完成的 Tool Result 可以直接回到当前 Agent Tool Calling 循环继续推理；对于长耗时异步操作，Java 根据后续 RobotEvent 更新 Command，并在需要继续当前 Step 时重新构造 ExecutionContext 唤醒动作 Agent。
 
 系统边界可以先记成三句话：
 
@@ -48,11 +48,11 @@
 ~~~text
 创建 Task
 ↓ Planning Agent
-↓ TaskDraft（包含多个业务 PlanStep）
+↓ TaskDraft（包含多个业务 TaskStep）
 ↓ Java Validator
 ↓ 人工审核并确认两小时预约
 ↓ 下发前复查、按实际开始延期并原子绑定 Robot
-↓ Java TaskExecutionService 选中当前 PlanStep
+↓ Java TaskExecutionService 选中当前 TaskStep
 ↓ 构造 ExecutionContext
 ↓ 动作 Agent
 ↓ tool_call：目标机器人 bot_mind Tool
@@ -68,12 +68,12 @@
    ↓ 当前 Agent 执行暂停，机器人继续实际执行
    RobotEvent 最终反馈
    ↓ Java 更新 RobotCommand
-   TaskExecutionService 重新判断当前 PlanStep
+   TaskExecutionService 重新判断当前 TaskStep
    ↓ 如需继续：新 ExecutionContext → 重新唤醒动作 Agent
 
 Step 完成
-↓ Java 将 PlanStep 标记为 SUCCEEDED
-↓ 推进下一 PlanStep
+↓ Java 将 TaskStep 标记为 SUCCEEDED
+↓ 推进下一 TaskStep
 ↓ Task COMPLETED
 ~~~
 
@@ -108,9 +108,8 @@ Step 完成
 | 对象 | 一句话解释 | 典型字段 |
 |---|---|---|
 | Robot | 一台可被分配的机器人及其最新运行快照、业务状态 | robotId, robotType, tags, onlineStatus, workStatus, areaCode, lastSeenAt, controlFresh, runtimeActivity, currentWaypoint, batteryPercent |
-| Task | 一批访客的一次完整接待任务 | taskId, requirement, status, assignedRobotId, scheduledAt, reservedUntil, actualStartedAt |
-| Plan | Task 经人工审核后的执行路线 | planId, taskId, version, status |
-| PlanStep | 一个业务阶段，例如 `VISIT A03`；不展开机器人内部每个动作 | stepId, type, targetCode, description, sequence, status |
+| Task | 一批访客的一次完整接待任务，直接包含审核后的步骤 | taskId, requirement, status, assignedRobotId, scheduledAt, reservedUntil, actualStartedAt, version |
+| TaskStep | 直接归属 Task 的业务阶段，例如 `VISIT A03`；不展开机器人内部每个动作 | stepId, taskId, type, targetCode, description, sequenceNo, status |
 | RobotCommand | 一次有副作用的机器人 Tool Calling 的持久化记录及当前状态快照 | commandId, taskId, stepId, robotId, toolName, payload, status |
 | RobotEvent | 机器人对某次 RobotCommand 的异步执行反馈 | eventId, commandId, type, occurredAt |
 
@@ -145,11 +144,11 @@ Java 用服务器接收时间更新 lastSeenAt。`ping` 成功只代表服务可
 
 **规划与执行的规则不同**：当前忙碌或离线不阻止生成未来草案；真正下发必须再次检查快照未过期、控制层健康、业务空闲及能力等条件。轮询不修改 currentTaskId，也不因设备离线自动释放任务占用。具体规划边界见第二部分。
 
-### PlanStep.type：业务步骤类型
+### TaskStep.type：业务步骤类型
 
-`PlanStep.type` 描述“这一阶段业务上要完成什么”，不描述机器人底层具体执行什么动作。第一版只保留少量稳定类型：
+`TaskStep.type` 描述“这一阶段业务上要完成什么”，不描述机器人底层具体执行什么动作。第一版只保留少量稳定类型：
 
-| PlanStep.type | 业务含义 | targetCode | 典型完成条件 | 动作 Agent 可能使用的 bot_mind Tool |
+| TaskStep.type | 业务含义 | targetCode | 典型完成条件 | 动作 Agent 可能使用的 bot_mind Tool |
 |---|---|---|---|---|
 | `VISIT` | 到指定展台并完成该站接待 | `A03`、`B05` | 到达目标展台，并完成该站讲解或接待流程 | `navigate_to`、`booth_show`，必要时 `play_named_action` |
 | `WAIT` | 当前业务流程暂时等待时间或现场指令 | 可为空 | 等待条件满足，例如用户说“继续” | 通常不主动调用动作 Tool；必要时使用 `stop_speaking`、`stop_robot` 等停止类 Tool |
@@ -157,7 +156,7 @@ Java 用服务器接收时间更新 lastSeenAt。`ping` 成功只代表服务可
 | `END` | 当前接待任务结束 | 可为空 | Java 完成 Task 收尾 | 通常不再产生机器人业务 Tool |
 
 ```java
-public enum PlanStepType {
+public enum TaskStepType {
     VISIT,   // 到目标展台并完成本站接待
     WAIT,    // 等待时间或现场继续指令
     RETURN,  // 返回指定集合点
@@ -165,40 +164,39 @@ public enum PlanStepType {
 }
 ```
 
-这四个值是允许的业务步骤类型，不表示每个 Plan 都必须包含四种步骤。Java 在交给动作 Agent 前校验类型与目标组合：`VISIT`、`RETURN` 必须提供已配置的 targetCode，`WAIT`、`END` 可以为空；模型不能用自由文本临时创造新类型或任意导航目标。
+这四个值是允许的业务步骤类型，不表示每个 Task 都必须包含四种步骤。Java 在交给动作 Agent 前校验类型与目标组合：`VISIT`、`RETURN` 必须提供已配置的 targetCode，`WAIT`、`END` 可以为空；模型不能用自由文本临时创造新类型或任意导航目标。
 
-还要区分 `PlanStep.type = WAIT` 与 `PlanStep.status = WAITING_INTERACTION`：前者是计划中明确安排的等待阶段，后者是任意 Step 执行到一半时的运行状态。例如 `VISIT B05` 到站后因“先别讲”进入 `WAITING_INTERACTION`，其 type 仍然是 `VISIT`。
+还要区分 `TaskStep.type = WAIT` 与 `TaskStep.status = WAITING_INTERACTION`：前者是计划中明确安排的等待阶段，后者是任意 Step 执行到一半时的运行状态。例如 `VISIT B05` 到站后因“先别讲”进入 `WAITING_INTERACTION`，其 type 仍然是 `VISIT`。
 
 ```text
 Robot 1 ─ n Task（历史上可以执行多个 Task）
 同一时刻，一个 Robot 最多执行一个活动 Task
-Task  1 ─ n Plan（历史版本，同一时刻一个活动版本）
-Plan  1 ─ n PlanStep
-PlanStep 1 ─ n RobotCommand
+Task  1 ─ n TaskStep（直接用 taskId 关联，按 sequenceNo 排序）
+TaskStep 1 ─ n RobotCommand
 RobotCommand 1 ─ 0..n RobotEvent
 ```
 
-这组关系表达的是历史记录，不表示机器人可以同时执行多个活动任务。
+这组关系表达的是历史记录，不表示机器人可以同时执行多个活动任务。任务直接维护步骤，不另建方案版本表。`Task.version` 只用于并发校验；已执行步骤及关联 Command/Event 保留，修改仅作用于尚未下发的步骤，具体边界见 2.4。
 
-PlanStep 记录业务目标，不把正常接待拆成 `NAVIGATE / SPEAK / WAVE` 等机器人动作步骤。`WAIT` 只表示业务计划明确要求的等待阶段，导航中的短暂等待或 Tool 内部暂停不会自动生成一个 WAIT Step。以 `S3 = VISIT A03` 为例，动作 Agent 为完成它可能发起多次有副作用的 Tool Calling，每次调用都伴随一条 RobotCommand 记录：
+TaskStep 记录业务目标，不把正常接待拆成 `NAVIGATE / SPEAK / WAVE` 等机器人动作步骤。`WAIT` 只表示业务计划明确要求的等待阶段，导航中的短暂等待或 Tool 内部暂停不会自动生成一个 WAIT Step。以 `S3 = VISIT A03` 为例，动作 Agent 为完成它可能发起多次有副作用的 Tool Calling，每次调用都伴随一条 RobotCommand 记录：
 
 ```text
-PlanStep S3：VISIT A03
+TaskStep S3：VISIT A03
 ↓ 动作 Agent
 ├─ tool_call：navigate_to("A03")          → RobotCommand C101
 ├─ tool_call：play_named_action("wave")  → RobotCommand C102
 └─ tool_call：booth_show("开始讲解展台") → RobotCommand C103
 ```
 
-`NAVIGATE`、`SPEAK`、`WAVE`、`PLAY_ACTION`、`TTS` 描述的是机器人能力或实现方式，不是当前 V2 的 StepType。同一个 `VISIT` 可能使用导航、挥手和讲解多个 Tool；如果把这些能力名提升为业务 Step 类型，正式 Plan 就会与 bot_mind 的具体实现耦合。
+`NAVIGATE`、`SPEAK`、`WAVE`、`PLAY_ACTION`、`TTS` 描述的是机器人能力或实现方式，不是当前 V2 的 StepType。同一个 `VISIT` 可能使用导航、挥手和讲解多个 Tool；如果把这些能力名提升为业务 Step 类型，已审核的 TaskStep 列表就会与 bot_mind 的具体实现耦合。
 
-因此 `PlanStep 1 ─ n RobotCommand` 表达的是：完成一个业务 Step 的过程中发生了多次具有副作用的机器人 Tool Calling。Tool 是 bot_mind 真正提供的能力；Command 是中央平台对调用的执行记录。C101、C102 成功只说明导航和挥手完成；只有 `VISIT A03` 的整体完成条件满足，Java 才能把 S3 标记为 `SUCCEEDED`。
+因此 `TaskStep 1 ─ n RobotCommand` 表达的是：完成一个业务 Step 的过程中发生了多次具有副作用的机器人 Tool Calling。Tool 是 bot_mind 真正提供的能力；Command 是中央平台对调用的执行记录。C101、C102 成功只说明导航和挥手完成；只有 `VISIT A03` 的整体完成条件满足，Java 才能把 S3 标记为 `SUCCEEDED`。
 
 
 ## 1.3 一个 Task 从创建到完成
 
 ```text
-Task CREATED → 生成 TaskDraft → 人工审核与预约 → Plan APPROVED
+Task CREATED → 生成 TaskDraft → 人工审核与预约 → Task APPROVED + TaskStep PENDING
 → 下发复查、按实际开始延期并原子绑定 Robot → Task RUNNING
 → TaskExecutionService 选择当前 Step 并构造 ExecutionContext
 → 动作 Agent 选择并调用 bot_mind Tool
@@ -230,7 +228,7 @@ Event   = 机器人后来告诉平台，这次调用实际执行得怎么样
 最小执行例子如下：
 
 ~~~text
-PlanStep S3：VISIT B05
+TaskStep S3：VISIT B05
         ↓ 动作 Agent
 tool_call：navigate_to("B05")
         ↓ Java 记录
@@ -396,7 +394,7 @@ commandId 由中央 Java 平台为每次副作用调用生成，用于归属 Ste
 3. 仍不确定则暂停 Step 并人工接管；
 4. 不能换新 ID 盲目重试移动或动作。
 
-RobotEvent 仍由 1.4 节的处理器落库：Java 先更新 RobotCommand，再由 TaskExecutionService 重新评估 Step。只有 Step 未完成且还需要继续执行时，Java 才构造新的 ExecutionContext 调用动作 Agent；整体条件满足时由 Java 把 PlanStep 标记成功并推进下一步。
+RobotEvent 仍由 1.4 节的处理器落库：Java 先更新 RobotCommand，再由 TaskExecutionService 重新评估 Step。只有 Step 未完成且还需要继续执行时，Java 才构造新的 ExecutionContext 调用动作 Agent；整体条件满足时由 Java 把 TaskStep 标记成功并推进下一步。
 
 接管时 Task 进入 PAUSED_MANUAL，Java 停止产生新命令并请求机器人停止/取消。进程退出和网络断开都不能证明机器人已安全停止，必须等待设备状态或现场确认。
 
@@ -404,8 +402,7 @@ RobotEvent 仍由 1.4 节的处理器落库：Java 先更新 RobotCommand，再�
 
 ~~~text
 Task              一次完整接待任务
-Plan              人工审核后的业务路线
-PlanStep          一个业务阶段，例如 VISIT A03
+TaskStep          直接归属 Task 的业务阶段，例如 VISIT A03
 Tool Call         动作 Agent 对 bot_mind 真实机器人能力的调用
 RobotCommand      中央平台对一次副作用 Tool Calling 保存的执行记录
 RobotEvent        机器人对某次 RobotCommand 的异步执行反馈
@@ -414,19 +411,19 @@ eventId           标识一次反馈，防止同一 Event 被重复处理
 UNKNOWN           表示结果暂时无法确认
 ~~~
 
-Java 是任务事实中心；机器人负责执行并回报。同步最终 Tool Result 在更新 RobotCommand 后直接返回当前 Agent Tool Loop；异步 RobotEvent 则由 Java 更新状态并恢复此前暂停的 Step。两条路径最终都由 Java 判断 PlanStep 是否完成。
+Java 是任务事实中心；机器人负责执行并回报。同步最终 Tool Result 在更新 RobotCommand 后直接返回当前 Agent Tool Loop；异步 RobotEvent 则由 Java 更新状态并恢复此前暂停的 Step。两条路径最终都由 Java 判断 TaskStep 是否完成。
 
 ---
 
 # 第二部分：中央规划 Agent ⭐⭐⭐
 
-> **这一部分要掌握什么**：从自然语言生成包含多个 PlanStep 的任务草案；区分当前状态、未来预约和实际执行；理解 Tool Calling、确定性校验、有限修订及人工审核怎样配合。章末给出连贯的 Controller → Service → Agent 示例。
+> **这一部分要掌握什么**：从自然语言生成包含多个 TaskStep 的任务草案；区分当前状态、未来预约和实际执行；理解 Tool Calling、确定性校验、有限修订及人工审核怎样配合。章末给出连贯的 Controller → Service → Agent 示例。
 
 ## 2.1 为什么需要 Planning Agent
 
 用户可能说：“明天下午带初中生参观，重点看 AI 互动项目，必须经过 A03。”模型需要结合展台主题、受众、默认参观顺序和机器人资料，生成任务内容及步骤。它不是只返回一句推荐理由，也不是只输出一串展台编号。
 
-本版分工是：**Java 预查询并精简展台台账、机器人台账，直接放入本轮 Prompt；Planning Agent 基于这些事实选择机器人和业务步骤，需要细节时才调用展台知识工具；Java 校验可计算的约束，工作人员审核；动作 Agent 把正式 PlanStep 落实为机器人 Tool 调用。**
+本版分工是：**Java 预查询并精简展台台账、机器人台账，直接放入本轮 Prompt；Planning Agent 基于这些事实选择机器人和业务步骤，需要细节时才调用展台知识工具；Java 校验可计算的约束，工作人员审核；动作 Agent 把正式 TaskStep 落实为机器人 Tool 调用。**
 
 本项目只有两台机器人、二十多个展台，规划时适合一次提供授权范围内的候选摘要，让模型比较“适合小学生”“科教性强”“科技感强”等偏好。完整讲稿、手册和历史任务不一并塞进 Prompt。未来台账规模明显增大时，再引入候选检索和分页，并确保必到点、修改任务的保留目标不被筛掉。
 
@@ -441,7 +438,7 @@ PlanningRequest：CREATE / EDIT_RUNNING_TASK
   ↓
 Java Evidence Builder：预查询授权范围内的展台、标签、机器人能力、当前快照和任务边界
   ↓
-Prompt Builder：精简 PlanEvidence + 已确认请求 + 输出 Schema，直接提供候选摘要
+Prompt Builder：精简 PlanningEvidence + 已确认请求 + 输出 Schema，直接提供候选摘要
   ↓
 Planning ChatClient：比较标签、受众与偏好；必要时调用只读知识工具补充细节
   ↓
@@ -454,19 +451,19 @@ Planning ChatClient：比较标签、受众与偏好；必要时调用只读知�
   ↓
 人工审核机器人、步骤、description，并确认预约
   ↓
-CREATE：保存正式 Task / Plan / PlanStep，预留两小时排期
+CREATE：保存正式 Task / TaskStep，预留两小时排期
 EDIT：在已完成当前站的暂停边界，替换尚未执行的后半段
   ↓
 真正下发前：Java 复查状态、排期和能力，原子绑定 Robot
   ↓
-Java 选中当前 PlanStep → 动作 Agent → bot_mind Tools
+Java 选中当前 TaskStep → 动作 Agent → bot_mind Tools
 ```
 
 这里只是一条规划链。`CREATE` 和 `EDIT_RUNNING_TASK` 决定 Evidence 与 Validator 使用什么规则，共用 ChatClient、解析器、修订循环和审核入口，不需要增加两个规划 Agent。
 
 页面已给定的机器人、时间、任务 ID 等直接构成 PlanningRequest。自然语言中的“必须去”“不要去”等可先由已有意图入口提取并让用户确认；**Validator 检查的是确认后的结构化约束，不声称 Java 可以从任意自然语言中完整提取所有要求。**原始需求始终保留给模型和审核人。
 
-## 2.3 PlanEvidence：当前事实与未来执行分开
+## 2.3 PlanningEvidence：当前事实与未来执行分开
 
 | 信息 | 从哪里来 | 规划时怎么用 |
 |---|---|---|
@@ -477,7 +474,7 @@ Java 选中当前 PlanStep → 动作 Agent → bot_mind Tools
 | 展台简述、主题标签、适合受众、体验标签、默认接待描述 | 管理员维护的结构化展台台账 | 直接进入 Prompt，比较“小学生、科教性强、科技感强”等软偏好 |
 | 展台所需业务标签和能力编码 | 已核实的执行要求 | Java 校验机器人能否服务该展台，和主题/受众标签分开 |
 | 完整介绍、演示要求、知识依据 | 已发布的展台资料/知识库 | 摘要不足时，通过只读工具按需取相关短片段 |
-| 当前任务版本、已完成边界、剩余 Step | EDIT 时读取 Task / Plan / PlanStep | 保留历史，只生成后半段 |
+| Task.version、已完成边界、未执行 TaskStep | EDIT 时读取 Task / TaskStep | 保留历史，只生成后半段 |
 
 创建草案时，`suggestedRobotId` 必须先填一台实际登记的机器人：用户指定则使用指定值；未指定则由模型在适用机器人中推荐一台。**这个字段先占位，不等于占用机器人，也不等于已经预约。**审核人可以换机器人，但换完仍要重新检查区域、标签和排期。
 
@@ -487,7 +484,7 @@ Java 选中当前 PlanStep → 动作 Agent → bot_mind Tools
 
 电量只读数据库中的当前数值及其采样时间，不预测走完整条路线需要多少电。缺失或过期要明确标注，不能当作满电。实际下发可使用现场配置的最低电量门槛；当前 `bot_mind` 状态接口若未提供电量，需补齐读取来源后才能启用该门禁，不能伪造已有字段。注册标签用于简单匹配，不根据型号名字推测技能；两台机器人的项目无需建设复杂能力推理系统。
 
-Java 在请求开始时读取一份带时间戳的 `PlanEvidence`，查询只限本次授权区域/线路，先处理权限、区域和确定的硬限制。**展台候选摘要与机器人摘要直接序列化到 Prompt，不要求模型再调用一个返回同样整份台账的 `queryPlanningContext`。**请求级工具只在摘要不足时检索展台详细资料，不能查询其他展厅、修改数据库或采集机器人硬件状态。同一轮修订使用同一份 Evidence，避免混用不同采样时刻；下发前再读取最新状态。
+Java 在请求开始时读取一份带时间戳的 `PlanningEvidence`，查询只限本次授权区域/线路，先处理权限、区域和确定的硬限制。**展台候选摘要与机器人摘要直接序列化到 Prompt，不要求模型再调用一个返回同样整份台账的 `queryPlanningContext`。**请求级工具只在摘要不足时检索展台详细资料，不能查询其他展厅、修改数据库或采集机器人硬件状态。同一轮修订使用同一份 Evidence，避免混用不同采样时刻；下发前再读取最新状态。
 
 ### 2.3.1 三类标签：偏好与能力分开
 
@@ -525,11 +522,15 @@ Java 在请求开始时读取一份带时间戳的 `PlanEvidence`，查询只限
 
 这里的 B 仍是普通 `VISIT`，不引入“回访”类型。它与历史 B 有不同 stepId。只检查新后半段自身是否重复，不把已经完成的 B 当作不能再去的禁区。新路线需要人工确认，机器人仍需能够到达对应点位。
 
-Java 记录草案所依据的 Plan 版本和已完成边界。审核应用时再次检查版本及暂停边界；若任务已继续前进，拒绝覆盖旧上下文并重新生成。旧 Plan 和执行记录保留，新 Plan 版本只安排剩余步骤；`sequence` 在新后半段从 1 开始，由 Java 生成新 ID 并关联到同一 Task。本文不扩展“正在讲 C 时强行中断”的实现。
+Java 记录草案所依据的 `Task.version`、最后完成的 `stepId` 和 `sequenceNo`。审核应用时再次检查任务版本和暂停边界；若任务已继续前进，拒绝应用过时草案。只允许替换边界之后仍为 `PENDING` 且从未产生 RobotCommand 的步骤；已完成、已下发、正在执行、失败或结果未知的步骤及其 Command/Event 都不能覆盖。后续存在任何不符合条件的步骤时，整次修改拒绝，交人工处理。本文不扩展“正在讲 C 时强行中断”的实现。
 
-## 2.5 TaskDraft、PlanStep 与默认接待描述
+为保持实现简单，审核事务保留已完成前缀的行、stepId、顺序与结果，删除满足上述条件的未执行后缀，再插入审核后的新后缀。**模型的 StepDraft.sequence 是本次草案的局部序号，从 1 开始；落库的 TaskStep.sequenceNo 是任务内序号，从已完成边界之后接续。** 例如 A、B、C 已完成，边界序号为 3，新草案 B、D、E、END 的 1～4 落成任务序号 4～7，新 B 使用新 stepId；历史 B 保留原 stepId。取消的未执行内容可从本次草案记录的 evidence_json、审核内容和操作留痕追溯，不保存整份路线版本。
 
-本章统一把模型输出叫 **TaskDraft**，替代以前只包含展台列表的 PlanDraft。它是任务内容草案，不是模型直接创建数据库 Task。CREATE 输出完整步骤；EDIT 输出任务标识对应的待替换后半段。taskId、Plan 版本等可信上下文由 Java 绑定，模型不生成数据库 ID、运行状态、commandId 或预约结束时间。
+审核修改与执行服务选择下一 Step、首次创建 RobotCommand，必须遵循同一 Task 行锁及版本检查，避免“刚检查为未执行，另一请求就下发”的竞争。步骤列表改变或执行边界推进时递增 `Task.version`；机器人状态轮询不递增它。事务内同时处理不再需要的展台候补/预约申请，不能删除真实占用。模型和机器人网络调用均在事务外，审核修改后任务保持暂停，明确继续后才下发。
+
+## 2.5 TaskDraft、TaskStep 与默认接待描述
+
+模型输出统一叫 **TaskDraft**。它是任务内容草案，不是模型直接创建数据库 Task。CREATE 输出完整步骤；EDIT 只输出待替换的未执行后半段。taskId、Task.version、完成边界和 TaskStep 的最终序号由 Java 绑定，模型不生成数据库 ID、运行状态、commandId 或预约结束时间。`PlanningEvidence` 只是本轮规划的事实 DTO，不是数据库实体。
 
 保留下面的完整设计示例：
 
@@ -557,7 +558,7 @@ Java 记录草案所依据的 Plan 版本和已完成边界。审核应用时再
 
 ```text
 Planning Agent：type=VISIT，targetCode=A03，description=面向初中生强调互动体验
-↓ 人工审核并保存 PlanStep
+↓ 人工审核并保存 TaskStep
 Java：把这三个字段、机器人状态、当前执行阶段放进 ExecutionContext
 ↓
 动作 Agent：按已批准目标选择 navigate_to / booth_show / 必要的动作 Tool
@@ -649,9 +650,9 @@ Validator：通过 → 保存 PENDING_REVIEW
 
 会话状态可放在 Java 内存，审核完成、主动结束或一段时间无活动后回收，例如 30 分钟。草案内容、有效请求和尝试记录仍按既有 `planning_draft` 落 PostgreSQL；短期聊天不做持久化，不新增聊天归档、需求快照或会话分支表。进程重启或会话过期后，不承诺恢复原对话，可选已保存草案重新规划。此处是追加会话的设计约定；2.10 的核心代码仍展示单次生成与自动修订，尚未展开会话管理接口。
 
-**历史计划只作为全新规划的蓝本。** 用户选择旧 Plan 或已保存草案时，Java 验证读取权限，创建新的 `planningSessionId`，不加载原 conversationId 或旧聊天。工作人员重新确认时间、受众、线路和其他要求；参考旧路线及接待描述，查询当前台账并重新生成、校验和审核。必要的旧条件可供用户显式勾选，不自动继承全部旧约束。旧任务状态、预约、机器人占用、审批结论和知识引用均不继承。
+**历史计划只作为全新规划的蓝本。** 用户选择历史 Task 的步骤或已保存草案时，Java 验证读取权限，创建新的 `planningSessionId`，不加载原 conversationId 或旧聊天。工作人员重新确认时间、受众、线路和其他要求；参考旧路线及接待描述，查询当前台账并重新生成、校验和审核。必要的旧条件可供用户显式勾选，不自动继承全部旧约束。旧任务状态、预约、机器人占用、审批结论和知识引用均不继承。
 
-历史蓝本入口按 `CREATE` 处理，`taskId=null`；可以记录一个可选来源 ID 供查看出处，不建立会话分支机制。审核后形成新任务，不覆盖历史任务。**这与 2.4 的 EDIT_RUNNING_TASK 不同**：后者是修改正在执行任务的未完成后半段，仍必须遵守原机器人、暂停边界和 Plan 版本检查。
+历史蓝本入口按 `CREATE` 处理，`taskId=null`；可以记录一个可选来源 ID 供查看出处，不建立会话分支机制。审核后形成新任务，不覆盖历史任务。**这与 2.4 的 EDIT_RUNNING_TASK 不同**：后者是修改正在执行任务的未完成后半段，仍必须遵守原机器人、暂停边界和 Task.version 检查。
 
 ## 2.8 人工审核、两小时预约与执行占用
 
@@ -705,7 +706,7 @@ import java.util.Set;
 public final class PlanningTypes {
     private PlanningTypes() {}
     public enum PlanningOperation { CREATE, EDIT_RUNNING_TASK }
-    public enum PlanStepType { VISIT, WAIT, RETURN, END }
+    public enum TaskStepType { VISIT, WAIT, RETURN, END }
     public static class InvalidPlanningRequest extends RuntimeException {
         public InvalidPlanningRequest(String message) { super(message); }
     }
@@ -729,7 +730,7 @@ public final class PlanningTypes {
     ) {}
 
     public record StepDraft(
-        @Min(1) int sequence, @NotNull PlanStepType type,
+        @Min(1) int sequence, @NotNull TaskStepType type,
         String targetCode,
         @NotBlank @Size(max = 200) String description
     ) {}
@@ -762,11 +763,12 @@ public final class PlanningTypes {
     ) {}
     public record RouteFact(String routeId, String areaCode, List<PointFact> points) {}
     public record EditBoundary(
-        String taskId, String robotId, long planVersion, String completedStepId,
+        String taskId, String robotId, long taskVersion,
+        String completedStepId, int completedSequenceNo,
         boolean pausedAfterCompletedStep, OffsetDateTime scheduledAt,
         List<StepDraft> remainingSteps
     ) {}
-    public record PlanEvidence(
+    public record PlanningEvidence(
         String evidenceId, Instant capturedAt, List<RobotFact> robots,
         RouteFact route, EditBoundary editBoundary
     ) {}
@@ -775,7 +777,7 @@ public final class PlanningTypes {
     public record Attempt(int number, String raw, List<Violation> violations) {}
     public record DraftRecord(
         String draftId, String actorId, String status, PlanningRequest request,
-        PlanEvidence evidence, TaskDraft draft, List<Attempt> attempts
+        PlanningEvidence evidence, TaskDraft draft, List<Attempt> attempts
     ) {}
     public record DraftResponse(
         String draftId, String status, TaskDraft draft, List<Violation> violations
@@ -831,7 +833,7 @@ public class EvidenceBuilder {
     private final PlanningRepository repository;
     public EvidenceBuilder(PlanningRepository repository) { this.repository = repository; }
 
-    public PlanEvidence build(String actor, PlanningRequest r) {
+    public PlanningEvidence build(String actor, PlanningRequest r) {
         if (!Collections.disjoint(r.mustVisit(), r.avoid()))
             throw new InvalidPlanningRequest("必到和禁入展台不能重叠");
         RouteFact route = repository.requireAuthorizedRoute(actor, r.routeId());
@@ -859,7 +861,7 @@ public class EvidenceBuilder {
             .filter(x -> x.robotId().equals(fixedRobot)).toList();
         if (robots.isEmpty())
             throw new InvalidPlanningRequest("没有适用的登记机器人；不等于当前没有在线机器人");
-        return new PlanEvidence(UUID.randomUUID().toString(), Instant.now(),
+        return new PlanningEvidence(UUID.randomUUID().toString(), Instant.now(),
             List.copyOf(robots), route, boundary);
     }
 }
@@ -883,14 +885,14 @@ import static example.planning.PlanningTypes.*;
 // 不标注 @Component：每个规划请求 new 一份，避免用户间共享查询证据。
 public class PlanningTools {
     private final String actor;
-    private final PlanEvidence evidence;
+    private final PlanningEvidence evidence;
     private final KnowledgeRepository knowledge;
     // 请求内保留真正交给模型的短片段，供后续修订重放；不跨用户共享。
     private final Map<String, KnowledgeSnippet> retainedKnowledge = new LinkedHashMap<>();
     private final Map<String, List<KnowledgeSnippet>> queryCache = new LinkedHashMap<>();
     private int calls;
 
-    public PlanningTools(String actor, PlanEvidence evidence, KnowledgeRepository knowledge) {
+    public PlanningTools(String actor, PlanningEvidence evidence, KnowledgeRepository knowledge) {
         this.actor = actor; this.evidence = evidence; this.knowledge = knowledge;
     }
     public synchronized Set<String> seenKnowledgeIds() {
@@ -979,7 +981,8 @@ public class PlanningAgent {
         CREATE 按线路 routeOrder 递增选择展台，覆盖必到，排除禁入。
         EDIT 仅输出尚未执行的后半段，保留未取消目标，按确认的新顺序生成；
         可以安排历史上去过的展台，不修改已完成历史，不更换当前机器人。
-        每个步骤提供 sequence、type、targetCode、description，sequence 从 1 连续递增。
+        每个步骤提供 sequence、type、targetCode、description，草案内 sequence 从 1 连续递增。
+        EDIT 的序号只表示新后半段顺序；Java 会接在已完成边界后，不能重写历史步骤。
         VISIT 是到站并完成接待；RETURN 是回配置集合点；WAIT 是业务等待；END 收尾且在最后。
         description 不超过 200 字，基于该展台默认接待描述按受众简短调整。
         不生成完整讲稿、脚本或 Tool 参数；描述不能改变 targetCode 或授权额外目标。
@@ -988,7 +991,7 @@ public class PlanningAgent {
         若收到 violations，结合 previousOutput 修正整份草案，不只输出补丁。
         """;
 
-    public String generate(PlanningRequest request, PlanEvidence evidence, PlanningTools tools,
+    public String generate(PlanningRequest request, PlanningEvidence evidence, PlanningTools tools,
                            String previousOutput, List<Violation> violations) {
         // 明确重传本轮候选摘要；同一个 ChatClient 不等于有跨请求模型记忆。
         // 只带最新错误输出；已检索的有界摘要重放，不重复塞入所有历史工具消息。
@@ -1072,7 +1075,7 @@ public class PlanningValidator {
     private final Validator beanValidator;
     public PlanningValidator(Validator beanValidator) { this.beanValidator = beanValidator; }
 
-    public List<Violation> validate(PlanningRequest r, PlanEvidence e,
+    public List<Violation> validate(PlanningRequest r, PlanningEvidence e,
                                    TaskDraft d, Set<String> seenIds) {
         List<Violation> errors = new ArrayList<>();
         beanValidator.validate(d).forEach(v -> errors.add(new Violation(
@@ -1095,11 +1098,11 @@ public class PlanningValidator {
             StepDraft s = d.steps().get(i);
             String field = "steps[" + i + "]";
             check(s.sequence() == i + 1, errors, "SEQUENCE", field, "序号须从 1 连续递增");
-            if (s.type() == PlanStepType.END) {
+            if (s.type() == TaskStepType.END) {
                 ends++;
                 check(i == d.steps().size() - 1, errors, "END_POSITION", field, "END 必须在最后");
             }
-            if (s.type() == PlanStepType.WAIT || s.type() == PlanStepType.END) {
+            if (s.type() == TaskStepType.WAIT || s.type() == TaskStepType.END) {
                 check(s.targetCode() == null, errors, "UNEXPECTED_TARGET", field, "本版 WAIT/END 的目标应为空");
                 continue;
             }
@@ -1113,7 +1116,7 @@ public class PlanningValidator {
                 errors, "BUSINESS_TAG", field, "机器人业务标签不满足目标要求");
             if (robot != null) check(robot.capabilityCodes().containsAll(point.requiredCapabilityCodes()),
                 errors, "CAPABILITY", field, "机器人已核实能力不满足展台要求");
-            if (s.type() == PlanStepType.RETURN) {
+            if (s.type() == TaskStepType.RETURN) {
                 check(point.returnOnly(), errors, "RETURN_TARGET", field, "RETURN 只能去配置集合点");
                 check(i == d.steps().size() - 2, errors, "RETURN_POSITION", field, "RETURN 放在 END 前");
             } else {
@@ -1132,7 +1135,7 @@ public class PlanningValidator {
             errors, "REQUESTED_ORDER", "steps", "与用户确认的展台顺序不一致");
         if (e.editBoundary() != null) {
             Set<String> retained = e.editBoundary().remainingSteps().stream()
-                .filter(s -> s.type() == PlanStepType.VISIT).map(StepDraft::targetCode)
+                .filter(s -> s.type() == TaskStepType.VISIT).map(StepDraft::targetCode)
                 .filter(code -> !r.avoid().contains(code)).collect(Collectors.toSet());
             check(visits.containsAll(retained), errors, "REMAINING_TARGET", "steps", "遗漏未明确取消的后续展台");
         } else check(!visits.isEmpty(), errors, "EMPTY_VISIT", "steps", "新接待任务至少安排一个展台");
@@ -1176,7 +1179,7 @@ public class PlanningService {
 
     // 不加长事务：数据库查询、模型网络调用、保存记录是分离的短操作。
     public DraftResponse generate(String actor, PlanningRequest request) {
-        PlanEvidence evidence = evidenceBuilder.build(actor, request);
+        PlanningEvidence evidence = evidenceBuilder.build(actor, request);
         PlanningTools tools = new PlanningTools(actor, evidence, knowledge);
         List<Attempt> attempts = new ArrayList<>();
         List<Violation> errors = List.of();
@@ -1313,27 +1316,30 @@ public class PlanningExceptionHandler {
 
 `findRegisteredRobots` 联合读取机器人配置、快照和未释放预约：按授权展厅、区域和启用配置查询，**不要写 `WHERE online_status='ONLINE' AND work_status='IDLE'`**。电量及时间戳允许为空；旧值不抹掉，但必须显示采样时间。机器人状态采集仍按 1.2 节独立运行。
 
-`requireAuthorizedBoundary` 读取任务绑定机器人、活动 Plan 版本、已完成 Step，以及未执行列表；只在 Task 已暂停且当前 Step 已完成时返回可编辑边界。历史 VISIT 不放入剩余目标校验集合。查询失败或越权直接终止，不让模型替用户查别人的任务。
+`requireAuthorizedBoundary` 直接查询 Task 及按 sequence_no 排序的 task_step，读取绑定机器人、Task.version、最后完成的 stepId/sequenceNo 和未执行列表。只在任务已暂停、当前 Step 已完成，且后续全部为 PENDING、从未产生 RobotCommand 时返回 EditBoundary；否则明确拒绝。remainingSteps 是未执行步骤的内容快照，历史 VISIT 不放入剩余目标校验集合。查询失败或越权直接终止，不让模型替用户查别人的任务。
 
-`saveDraft` 在短事务内向现有 `planning_draft` 写入 draftId、actorId、status、request_json、evidence_json、draft_json、attempts_json；请求和 Evidence 中已经包含 EDIT 的 taskId、基础版本及完成边界。ID、创建时间由 Java/数据库提供，JSON 使用参数绑定并转为 PostgreSQL jsonb，不拼接用户字符串。失败草案的 draft_json 可为 NULL，原始输出保存在 attempts_json。原始文本只供授权审核查看，按文本渲染，不作为 HTML 执行。
+`saveDraft` 在短事务内向现有 `planning_draft` 写入 draftId、actorId、status、request_json、evidence_json、draft_json、attempts_json；请求和 Evidence 中已经包含 EDIT 的 taskId、基础 Task.version 及完成边界。ID、创建时间由 Java/数据库提供，JSON 使用参数绑定并转为 PostgreSQL jsonb，不拼接用户字符串。失败草案的 draft_json 可为 NULL，原始输出保存在 attempts_json。原始文本只供授权审核查看，按文本渲染，不作为 HTML 执行。
 
 审核服务必须读取这条记录而非相信前端提交的“已经通过”。重新校验审核后内容及最新配置，再按操作执行：
 
 ```text
 CREATE 审核确认事务：
 锁 Robot 行 → 检查 Task 预约区间冲突
-→ 保存 Task APPROVED、Plan、PlanStep（含 description）及两小时预约
+→ 保存 Task APPROVED、直接关联 taskId 的 TaskStep（含 description）及两小时预约
 → 将草案标记为已应用 → 提交
 
 EDIT 审核应用事务：
-锁 Task / 当前 Plan → 校验草案基础版本和已完成暂停边界
-→ 保留历史、创建新版本及新的剩余 PlanStep
-→ 更新 Task 活动 Plan，并将草案标记为已应用 → 提交
+锁 Task 行 → 核对 evidence.editBoundary.taskVersion、暂停状态和完成边界
+→ 重查后续步骤全部为 PENDING，且从未产生 RobotCommand，否则整次拒绝
+→ 保留已完成步骤及 Command/Event，只删除符合条件的未执行后缀
+→ 插入新 TaskStep：taskId 不变，sequenceNo = completedSequenceNo + 草案 sequence
+→ 更新有效需求和展台申请，Task.version 加一，记录修改人、时间与草案 ID
+→ 将草案标记为已应用，Task 保持暂停 → 提交
 ```
 
-重复点击审核只应用一次；草案状态条件更新必须与上述写入同一事务。执行下发另走 2.8 的状态复查与原子绑定。至此完整链条是：**模型生成内容与业务步骤，Java 校验、审核、预约和推进状态，动作 Agent 完成当前步骤的 Tool 编排。**
+重复点击审核只应用一次；草案状态条件更新必须与上述写入同一事务。CREATE 使用模型的局部序号作为任务内序号；EDIT 只能按完成边界接续，不能把已有 A、B、C 的序号重置。审核人、审核时间及草案关联由 Java 保存到 task/planning_draft；不新增方案版本表。执行下发另走 2.8 的状态复查与原子绑定。至此完整链条是：**模型生成内容与业务步骤，Java 校验、审核、预约和推进状态，动作 Agent 完成当前步骤的 Tool 编排。**
 
-学习验证至少覆盖：两台离线仍可生成草案；CREATE 折返被拒；EDIT 的 B→D→E 允许且不删除历史；未知机器人/展台被拒；格式错误反馈修订；最多三次停止；description 默认模板保留；不同请求的工具证据互不串用。模型真实效果需另以现场需求回归测试，不能由代码单元测试代替。
+学习验证至少覆盖：两台离线仍可生成草案；CREATE 折返被拒；EDIT 的 B→D→E 允许且已完成步骤的 stepId/结果不变，新步骤序号接续；后续已有 Command 时整次修改拒绝；Task.version 过期或边界推进时拒绝；未知机器人/展台被拒；格式错误反馈修订；最多三次停止；description 默认模板保留；不同请求的工具证据互不串用。模型真实效果需另以现场需求回归测试，不能由代码单元测试代替。
 
 ---
 
@@ -1344,7 +1350,7 @@ EDIT 审核应用事务：
 ## 3.1 从 Java 到机器人的完整调用链
 
 ```text
-Java TaskExecutionService 选中当前 PlanStep
+Java TaskExecutionService 选中当前 TaskStep
   ↓ 构造 ExecutionContext
 动作 Agent 产生 tool_call
   ↓ Java ToolCallback / MCP Client
@@ -1378,14 +1384,14 @@ RobotController
 
 G1ControlServer 统一承接需要持续反馈的导航 Action、短时控制 Service 和运行状态发布；RobotController 再把这些上层调用收敛到导航、底盘、手臂和安全状态。正文不枚举所有接口，只保留职责边界：
 
-- Java TaskExecutionService 决定当前执行哪个正式 PlanStep，并维护业务状态；
+- Java TaskExecutionService 决定当前执行哪个正式 TaskStep，并维护业务状态；
 - 动作 Agent 根据 ExecutionContext 选择并组合 bot_mind Tools；
 - bot_mind 承接机器人本机语音、讲解与技能；
 - G1ControlServer 是 ROS2 控制入口，提供导航 Action、动作/移动/停止 Service 并发布状态；
 - RobotController 组合导航、运动和安全状态；
 - UnitreeSdkBridge / Worker 隔离 SDK。
 
-动作 Agent（文档中的 Robot Control Agent）是 PlanStep 的统一机器人 Tool 执行入口。语义上它直接调用 bot_mind 暴露的 Tool；技术上 Spring AI ToolCallback / MCP Client 是受控调用边界，负责绑定 robotId、校验权限和参数、伴随保存 RobotCommand，并执行真实的 `tools/call`。ToolCallback 不选择业务动作，也不是第二个决策 Agent。本章描述 Tool 调用之后的机器人执行层，它负责让动作真正、安全、可取消地执行。
+动作 Agent（文档中的 Robot Control Agent）是 TaskStep 的统一机器人 Tool 执行入口。语义上它直接调用 bot_mind 暴露的 Tool；技术上 Spring AI ToolCallback / MCP Client 是受控调用边界，负责绑定 robotId、校验权限和参数、伴随保存 RobotCommand，并执行真实的 `tools/call`。ToolCallback 不选择业务动作，也不是第二个决策 Agent。本章描述 Tool 调用之后的机器人执行层，它负责让动作真正、安全、可取消地执行。
 
 ## 3.3 为什么使用独立 Python Worker
 
@@ -1540,7 +1546,7 @@ conversationId 隔离语义，请求级 QaTools 隔离业务数据访问。
 
 ## 4.7 意图识别
 
-“停止”“下一站”等明确指令由 Java 规则直接处理；识别为 `NEXT_STEP` 后，Java 必须根据已审核的正式 Plan 查询当前 Step 和下一个 Step，再校验 Task、Robot 与目标展台。动作 Agent 不允许根据自然语言自己猜下一站。未命中规则的复杂文本才进入无工具、低温度、结构化输出的 Intent ChatClient：
+“停止”“下一站”等明确指令由 Java 规则直接处理；识别为 `NEXT_STEP` 后，Java 必须根据已审核的 TaskStep 列表查询当前 Step 和下一个 Step，再校验 Task、Robot 与目标展台。动作 Agent 不允许根据自然语言自己猜下一站。未命中规则的复杂文本才进入无工具、低温度、结构化输出的 Intent ChatClient：
 
 ```text
 ROBOT_CONTROL / KNOWLEDGE_QA / CENTRAL_PLANNING / OTHER
@@ -1557,8 +1563,8 @@ ROBOT_CONTROL / KNOWLEDGE_QA / CENTRAL_PLANNING / OTHER
 这条执行链只有一个机器人 Tool 决策入口：
 
 ```text
-Planning Agent       → 决定去哪，形成正式 Plan
-Java TaskExecutionService → 决定现在执行哪个 PlanStep
+Planning Agent       → 生成业务步骤草案，人工审核后保存 TaskStep
+Java TaskExecutionService → 决定现在执行哪个 TaskStep
 动作 Agent           → 决定当前 Step 调用哪些 bot_mind Tools
 bot_mind             → 定义并实现具体 Tool
 Java 状态机          → 保存事实并修改 Task / Step 状态
@@ -1566,20 +1572,20 @@ Java 状态机          → 保存事实并修改 Task / Step 状态
 
 TaskExecutionService 只负责查询当前正式 Step、判断是否允许开始、构造 ExecutionContext、接收 Agent 执行结果、更新 Step 状态并推进下一 Step。它不决定调用 `navigate_to`、`booth_show` 还是 `play_named_action`。
 
-每个需要机器人执行的业务 PlanStep 都由动作 Agent 根据 ExecutionContext 调用 bot_mind Tools 完成。普通 `VISIT` 因上下文简单，Agent 通常执行 `navigate_to → booth_show` 的标准组合；出现“先别讲”“到站挥手”等临时要求时，仍是同一个 Agent，只是调整 Tool 顺序和等待条件。
+每个需要机器人执行的业务 TaskStep 都由动作 Agent 根据 ExecutionContext 调用 bot_mind Tools 完成。普通 `VISIT` 因上下文简单，Agent 通常执行 `navigate_to → booth_show` 的标准组合；出现“先别讲”“到站挥手”等临时要求时，仍是同一个 Agent，只是调整 Tool 顺序和等待条件。
 
-动作 Agent 不决定正式 Plan 的下一 Step，也不修改 Task、PlanStep、RobotCommand 或 RobotEvent 数据。它可以通过白名单 Tool Calling 发起机器人能力调用，但不能绕过 Tool 门禁直接访问 ROS2、Unitree SDK、Shell 或任意机器人接口。
+动作 Agent 不决定已审核的 TaskStep 列表的下一 Step，也不修改 Task、TaskStep、RobotCommand 或 RobotEvent 数据。它可以通过白名单 Tool Calling 发起机器人能力调用，但不能绕过 Tool 门禁直接访问 ROS2、Unitree SDK、Shell 或任意机器人接口。
 
 ### 4.8.2 ExecutionContext
 
-TaskExecutionService 从当前 Task、正式 Plan、PlanStep、Robot 状态、RobotCommand 当前状态和 Java 整理后的结果摘要临时组装只读上下文，不要求新增数据库表。RobotEvent 先由 Java 归并到 Command 和结果摘要，不会原样交给动作 Agent：
+TaskExecutionService 从当前 Task、正在执行的 TaskStep、Robot 状态、RobotCommand 当前状态和 Java 整理后的结果摘要临时组装只读上下文，不要求新增数据库表。RobotEvent 先由 Java 归并到 Command 和结果摘要，不会原样交给动作 Agent：
 
 ```java
 public record ExecutionContext(
     String taskId,
     String stepId,
     String robotId,
-    PlanStepType stepType,
+    TaskStepType stepType,
     String targetCode,
     String description, // 审核后的本站接待重点，不得改变目标展台
     String currentRobotState,
@@ -1588,7 +1594,7 @@ public record ExecutionContext(
 ) {}
 ```
 
-它明确告诉 Agent：执行哪个 Step、控制哪台机器人、业务上要完成什么、目标在哪里、已经完成到哪一步以及本轮有什么临时要求。`stepType` 和 `targetCode` 来自 Java 查询的正式 Plan，不能由 Agent 猜测或改写。
+它明确告诉 Agent：执行哪个 Step、控制哪台机器人、业务上要完成什么、目标在哪里、已经完成到哪一步以及本轮有什么临时要求。`stepType` 和 `targetCode` 来自 Java 查询的当前已审核 TaskStep，不能由 Agent 猜测或改写。
 
 机器人能力来自目标机器人上的 bot_mind。Java/Spring AI 通过 `tools/list` 获取 Tool 定义，通过受控 ToolCallback / MCP Client 执行 `tools/call`。当前源码中的代表性工具包括：
 
@@ -1609,12 +1615,12 @@ public record ExecutionContext(
 2. `targetCode` 提供 Java 已确认的固定业务目标，Agent 不能自行换站；
 3. `currentRobotState`、`executionPhase`、`temporaryInstruction` 等上下文决定现在应该调用哪个 Tool、等待还是结束本 Step。
 
-Java 把已审核 PlanStep 的 `type + targetCode + description` 一并放入 ExecutionContext。description 可指导本站接待方式，不能更换目标或绕过 Tool 参数校验。
+Java 把已审核 TaskStep 的 `type + targetCode + description` 一并放入 ExecutionContext。description 可指导本站接待方式，不能更换目标或绕过 Tool 参数校验。
 
 Agent 不是只看到一个 `"VISIT"` 字符串后自由猜测。Java 会同时提供 ExecutionContext、目标机器人的 Tool Schema，并在系统提示中预先定义 StepType 语义和完成目标，例如：
 
 ```text
-你只能围绕当前 ExecutionContext 完成当前 PlanStep：
+你只能围绕当前 ExecutionContext 完成当前 TaskStep：
 
 VISIT：在 targetCode 指定展台完成一次接待。
 通常需要到达目标，并完成该站讲解或接待流程。
@@ -1624,11 +1630,11 @@ RETURN：返回 targetCode 指定位置。
 确认到达该位置后，可以报告当前 Step 已完成。
 
 WAIT：暂停推进当前业务流程，等待时间条件或新的现场指令。
-不得自行选择或推进下一个正式 PlanStep，也不存在必须调用的 wait Tool。
+不得自行选择或推进下一个正式 TaskStep，也不存在必须调用的 wait Tool。
 
 END：不再发起新的机器人业务动作，返回收尾结果，由 Java 完成 Task 收尾。
 
-Tool Result 只说明某次能力调用的结果；不得自行修改 PlanStep 状态。
+Tool Result 只说明某次能力调用的结果；不得自行修改 TaskStep 状态。
 ```
 
 ```text
@@ -1644,14 +1650,14 @@ END + targetCode=null               → 不调用机器人业务 Tool，由 Java
 
 这不是把 `type` 硬编码成唯一 Tool：`VISIT` 可能因为现场要求增加 `play_named_action`，也可能在到站后先等待。但 Java ToolCallback 仍要校验 Tool 与当前 Step 是否相容，例如 `RETURN LOBBY` 的 `navigate_to` 参数不能被模型改成未授权点位。
 
-完成条件也不能只看 Tool 名字。`navigate_to("A03") → SUCCEEDED` 只证明机器人已到达 A03；如果 `VISIT A03` 还要求完成该站讲解或接待，Java 不能把 Step 标成成功。对于只要求回到指定位置的 `RETURN HOME`，关联 HOME 的最终导航成功结果则可能已经满足整个 Step。**Tool Result 表示一次机器人能力调用结果；PlanStep 是否完成，要按 StepType 的业务完成条件由 Java 状态机最终判断。**
+完成条件也不能只看 Tool 名字。`navigate_to("A03") → SUCCEEDED` 只证明机器人已到达 A03；如果 `VISIT A03` 还要求完成该站讲解或接待，Java 不能把 Step 标成成功。对于只要求回到指定位置的 `RETURN HOME`，关联 HOME 的最终导航成功结果则可能已经满足整个 Step。**Tool Result 表示一次机器人能力调用结果；TaskStep 是否完成，要按 StepType 的业务完成条件由 Java 状态机最终判断。**
 
 ### 4.8.3 Agent 直接 Tool Calling
 
 “动作 Agent 直接调用 bot_mind Tool”是语义定义：Agent 选择的就是 bot_mind 实际暴露的 Tool，不先生成另一套 RobotCommand 控制协议。Spring AI / Java ToolCallback 是安全和持久化边界，不是第二个机器人决策层。
 
 ```text
-PlanStep S2：VISIT B05
+TaskStep S2：VISIT B05
           ↓
        动作 Agent
           ↓
@@ -1680,21 +1686,21 @@ Agent 继续推理
 ↓ tool_call B
 Tool Result B = 最终结果
 ↓
-Agent 返回当前 PlanStep 的执行结果
+Agent 返回当前 TaskStep 的执行结果
 ```
 
 例如 `VISIT A03` 中，`play_named_action("wave")` 如果等待动作真正完成并返回 `SUCCEEDED`，结果会直接回到当前 Agent，Agent 可以继续调用 `booth_show(...)`。这些 Tool 都返回最终结果时，可以在同一次 Agent 执行中连续完成，`onCommandUpdated()` 不是每一步的必经入口。
 
 如果 `navigate_to("A03")` 只返回 `ACCEPTED`，导航仍在异步执行，当前 Agent Loop 必须暂停。之后等待 RobotEvent 最终反馈，由 Java 更新 Command、重新评估 Step，并在仍需继续时使用新的 ExecutionContext 重新唤醒动作 Agent。动作 Agent 不直接订阅或消费 RobotEvent。
 
-### 4.8.4 普通 PlanStep 怎样执行
+### 4.8.4 普通 TaskStep 怎样执行
 
 正式计划给出：
 
 ```text
 Task T100
 Robot R1
-PlanStep S3：VISIT A03
+TaskStep S3：VISIT A03
 ```
 
 TaskExecutionService 构造 `stepType = VISIT`、`targetCode = A03`、`temporaryInstruction = null` 的 ExecutionContext。动作 Agent 据此判断业务目标是“到 A03 并完成本站接待”，再结合机器人状态执行标准 Tool 组合。具体如何衔接取决于对应 bot_mind Tool 的真实返回语义：
@@ -1753,7 +1759,7 @@ S3.status → WAITING_INTERACTION
 → S3.status → SUCCEEDED
 ```
 
-如果上述 Tool 同步返回最终结果，Agent 可在当前 Tool Loop 中继续；如果导航只返回 `ACCEPTED`，则在 RobotEvent 到达后由 Java 用新 ExecutionContext 恢复。临时自然语言要求只改变当前 Step 的 Tool 调用方式，不改变 `PlanStep.type`、`targetCode` 或正式路线。
+如果上述 Tool 同步返回最终结果，Agent 可在当前 Tool Loop 中继续；如果导航只返回 `ACCEPTED`，则在 RobotEvent 到达后由 Java 用新 ExecutionContext 恢复。临时自然语言要求只改变当前 Step 的 Tool 调用方式，不改变 `TaskStep.type`、`targetCode` 或正式路线。
 
 ### 4.8.5 “下一站，但是到了先别讲”怎样执行
 
@@ -1770,7 +1776,7 @@ S2 = VISIT B05（下一步）
 机器人麦克风 → ASR
 → 中央 Java / Intent 解析
 → Java 识别 NEXT_STEP
-→ 根据正式 Plan 确定下一 Step = S2，targetCode = B05
+→ 根据已审核的 TaskStep 列表确定下一 Step = S2，targetCode = B05
 → temporaryInstruction = "到站以后先不要讲解"
 → TaskExecutionService 校验当前 S1 允许切换，再将 S2 设为当前活动 Step
 → 构造 ExecutionContext(T100, S2, R1, VISIT, B05, ..., temporaryInstruction)
@@ -1809,18 +1815,18 @@ Java 确认 T100 / S2 / R1 / B05 仍匹配当前活动 Step
 → TaskExecutionService 推进下一正式 Step
 ```
 
-“去下一站”的目标 Step 由 Java 根据正式 Plan 确定；“到了先别讲”的执行方式由动作 Agent 理解并落实。工具失败时，Agent 只能在当前 Step 和策略允许范围内改参、停止或等待，不能改写后续路线；取消与停止仍调用 `stop_robot`、`stop_speaking` 等白名单 Tool。同步最终结果直接续接当前 Agent；只有异步执行暂停后，才由 RobotEvent 触发 Java 恢复 Step。
+“去下一站”的目标 Step 由 Java 根据已审核的 TaskStep 列表确定；“到了先别讲”的执行方式由动作 Agent 理解并落实。工具失败时，Agent 只能在当前 Step 和策略允许范围内改参、停止或等待，不能改写后续路线；取消与停止仍调用 `stop_robot`、`stop_speaking` 等白名单 Tool。同步最终结果直接续接当前 Agent；只有异步执行暂停后，才由 RobotEvent 触发 Java 恢复 Step。
 
 完整心智模型如下：
 
 ```text
 Planning Agent：“去哪？”
         ↓
-正式 Plan
+已审核的 TaskStep 列表
         ↓
 Java TaskExecutionService：“现在执行哪个 Step？”
         ↓
-PlanStep：VISIT B05
+TaskStep：VISIT B05
         ↓
 ExecutionContext
         ↓
@@ -1882,13 +1888,13 @@ ChatMemory 管“之前聊过什么”，请求级 QaTools 管“当前允许查
 
 ### Q1：Step、Tool、Command、Event 分别是什么？
 
-**推荐回答：** PlanStep 是 `VISIT B05` 这样的业务目标；Tool 是机器人真正提供的能力；RobotCommand 记录这次调用了哪个有副作用的 Tool 以及当前状态；RobotEvent 是机器人对某次 RobotCommand 的异步执行反馈。同步最终 Tool Result 可以直接回到当前 Agent Loop；异步 Event 则由 Java 更新 Command 并恢复 Step。
+**推荐回答：** TaskStep 是 `VISIT B05` 这样的业务目标；Tool 是机器人真正提供的能力；RobotCommand 记录这次调用了哪个有副作用的 Tool 以及当前状态；RobotEvent 是机器人对某次 RobotCommand 的异步执行反馈。同步最终 Tool Result 可以直接回到当前 Agent Loop；异步 Event 则由 Java 更新 Command 并恢复 Step。
 
 **一句话记忆：** Step 是目标，Tool 是能力，Command 记当前调用，Event 是异步反馈。
 
 #### 追问：RobotEvent 是什么？
 
-**推荐回答：** RobotEvent 是机器人对某次 RobotCommand 的异步执行反馈。比如导航 Tool 已经发出后，机器人稍后回报导航成功或失败。Java 根据 Event 更新 Command，再判断当前 PlanStep 是否完成。
+**推荐回答：** RobotEvent 是机器人对某次 RobotCommand 的异步执行反馈。比如导航 Tool 已经发出后，机器人稍后回报导航成功或失败。Java 根据 Event 更新 Command，再判断当前 TaskStep 是否完成。
 
 **一句话记忆：** Event 是机器人异步执行反馈。
 
@@ -1940,7 +1946,7 @@ ChatMemory 管“之前聊过什么”，请求级 QaTools 管“当前允许查
 
 **追问：Reviser 换了 ChatClient 或 Prompt 吗？** 没有。同一个客户端和 SYSTEM/Schema，只在本轮输入中带上最新错误输出和校验错误；重传相同台账及已检索摘要。每次仍消耗输入 token，复用客户端不是缓存。服务端前缀缓存需要实际支持并命中，只能按其计费规则减少成本，不能把上下文当成免费。
 
-**追问：C 已完成，却要求接下来 B、D、E，Validator 不会拦吗？** CREATE 遵循默认顺序；显式 EDIT 允许改变未执行部分，按确认的新顺序校验，不禁止新步骤出现历史上去过的 B。审核应用时复查 Plan 版本和暂停边界。
+**追问：C 已完成，却要求接下来 B、D、E，Validator 不会拦吗？** CREATE 遵循默认顺序；显式 EDIT 允许改变未执行部分，按确认的新顺序校验，不禁止新步骤出现历史上去过的 B。审核应用时复查 Task.version 和暂停边界。
 
 **一句话记忆：** 确定性规则交 Validator，接待描述和取舍交人工审核。
 
@@ -2052,9 +2058,9 @@ ChatMemory 管“之前聊过什么”，请求级 QaTools 管“当前允许查
 
 ### Q16：动作 Agent 到底负责什么？
 
-**推荐回答：** Planning Agent 决定机器人和展台路线，PlanStep 用 `type + targetCode + description` 保存 `VISIT A03` 这样的业务目标。动作 Agent 读取 Java 给出的 type、targetCode 和 ExecutionContext：type 限定要完成的业务，targetCode 固定目标，description 提供本站接待重点，机器人状态、执行阶段和临时要求决定下一次调用哪个 bot_mind Tool。Java 保存 Command 当前状态、处理异步 Event 并重新判断 Step，bot_mind 和 G1 执行具体技能。
+**推荐回答：** Planning Agent 决定机器人和展台路线，TaskStep 用 `type + targetCode + description` 保存 `VISIT A03` 这样的业务目标。动作 Agent 读取 Java 给出的 type、targetCode 和 ExecutionContext：type 限定要完成的业务，targetCode 固定目标，description 提供本站接待重点，机器人状态、执行阶段和临时要求决定下一次调用哪个 bot_mind Tool。Java 保存 Command 当前状态、处理异步 Event 并重新判断 Step，bot_mind 和 G1 执行具体技能。
 
-**追问：** 谁决定当前执行哪个 Step？TaskExecutionService 根据正式 Plan 决定。动作 Agent 直接选择白名单 MCP Tools，但不能猜下一 Step、修改业务状态或绕过 Tool 门禁访问 ROS2、SDK、Shell。
+**追问：** 谁决定当前执行哪个 Step？TaskExecutionService 根据已审核的 TaskStep 列表决定。动作 Agent 直接选择白名单 MCP Tools，但不能猜下一 Step、修改业务状态或绕过 Tool 门禁访问 ROS2、SDK、Shell。
 
 **一句话记忆：** Planning 决定去哪，动作 Agent 决定当前 Step 动态怎么完成。
 
@@ -2076,7 +2082,7 @@ ChatMemory 管“之前聊过什么”，请求级 QaTools 管“当前允许查
 
 ### Q19：“下一站”和“下一站但是先别讲”怎样执行？
 
-**推荐回答：** 两者的目标都由 Java 根据正式 Plan 确定，例如下一 Step 是 `S2 = VISIT B05`，动作 Agent 不能猜。普通“下一站”构造无临时要求的 ExecutionContext，Agent 正常调用 `navigate_to → booth_show`；“下一站但是先别讲”则把“到站后先不讲”放入 temporaryInstruction，Agent 导航成功后返回等待结果，由 Java 将 S2 更新为 `WAITING_INTERACTION`。用户说“开始讲”后，Java 校验仍是 T100/S2/R1/B05，再让 Agent 调用 `booth_show`。
+**推荐回答：** 两者的目标都由 Java 根据已审核的 TaskStep 列表确定，例如下一 Step 是 `S2 = VISIT B05`，动作 Agent 不能猜。普通“下一站”构造无临时要求的 ExecutionContext，Agent 正常调用 `navigate_to → booth_show`；“下一站但是先别讲”则把“到站后先不讲”放入 temporaryInstruction，Agent 导航成功后返回等待结果，由 Java 将 S2 更新为 `WAITING_INTERACTION`。用户说“开始讲”后，Java 校验仍是 T100/S2/R1/B05，再让 Agent 调用 `booth_show`。
 
 **追问：** 谁修改 `WAITING_INTERACTION`？动作 Agent 只返回等待结果，Java Task/Step 状态机负责修改。
 
@@ -2086,15 +2092,15 @@ ChatMemory 管“之前聊过什么”，请求级 QaTools 管“当前允许查
 
 ## 5.7 一分钟项目介绍
 
-我参与的是一个多机器人具身智能展厅项目，主要负责 Spring Boot 中央调度平台、中央规划 Agent，以及 G1 动作编排与执行模块。Java 定时轮询每台固定 IP 机器人的 MCP `ping`、`get_robot_state` 和 `get_current_waypoint`，维护可检验的状态快照；Java 预查询展台台账和主题/受众/体验标签、机器人登记能力与当前快照，以精简摘要构建 Prompt；Planning Agent 据此生成包含机器人建议和多个业务 Step 的 TaskDraft，必要时检索详细展台资料；当前离线或忙碌不妨碍未来草案，经 Validator、同一客户端有限修订和人工审核确认预约，实际下发时复查并原子绑定机器人。执行时 Java 根据正式 Plan 选择当前业务 Step，并提供 ExecutionContext；动作 Agent 通过 Spring AI Tool Calling 编排目标机器人 bot_mind 暴露的导航、讲解和动作能力。平台对每次有副作用的 Tool Calling 保存 RobotCommand：同步最终 Tool Result 直接回到当前 Agent Loop，长耗时调用返回 `accepted` 时则暂停，等 RobotEvent 到达后由 Java 更新状态并恢复当前 Step。执行侧还使用 commandId、UNKNOWN 对账和人工接管处理不确定结果；动作 Agent 属于我为理解完整系统梳理的 V2 深化设计，不是我主责开发的模块。
+我参与的是一个多机器人具身智能展厅项目，主要负责 Spring Boot 中央调度平台、中央规划 Agent，以及 G1 动作编排与执行模块。Java 定时轮询每台固定 IP 机器人的 MCP `ping`、`get_robot_state` 和 `get_current_waypoint`，维护可检验的状态快照；Java 预查询展台台账和主题/受众/体验标签、机器人登记能力与当前快照，以精简摘要构建 Prompt；Planning Agent 据此生成包含机器人建议和多个业务 Step 的 TaskDraft，必要时检索详细展台资料；当前离线或忙碌不妨碍未来草案，经 Validator、同一客户端有限修订和人工审核确认预约，实际下发时复查并原子绑定机器人。执行时 Java 根据已审核的 TaskStep 列表选择当前业务 Step，并提供 ExecutionContext；动作 Agent 通过 Spring AI Tool Calling 编排目标机器人 bot_mind 暴露的导航、讲解和动作能力。平台对每次有副作用的 Tool Calling 保存 RobotCommand：同步最终 Tool Result 直接回到当前 Agent Loop，长耗时调用返回 `accepted` 时则暂停，等 RobotEvent 到达后由 Java 更新状态并恢复当前 Step。执行侧还使用 commandId、UNKNOWN 对账和人工接管处理不确定结果；动作 Agent 属于我为理解完整系统梳理的 V2 深化设计，不是我主责开发的模块。
 
 ## 5.8 三分钟项目介绍
 
-项目要解决的是两台机器人同时承担展厅接待时，中央平台怎样把自然语言需求变成计划，并可靠推进导航、讲解和动作。Java 平台采用模块化单体和 PostgreSQL，以 Task 表示一次接待，以审核后的 Plan 和 PlanStep 表示业务顺序。Tool 是 bot_mind 真正提供的机器人能力；RobotCommand 是中央平台对一次副作用 Tool Calling 保存的执行记录和当前状态快照；RobotEvent 是机器人对某次 RobotCommand 的异步执行反馈。LLM 不直接改业务状态。
+项目要解决的是两台机器人同时承担展厅接待时，中央平台怎样把自然语言需求变成计划，并可靠推进导航、讲解和动作。Java 平台采用模块化单体和 PostgreSQL，以 Task 表示一次接待，以直接归属 Task 的 TaskStep 表示审核后的业务顺序。Tool 是 bot_mind 真正提供的机器人能力；RobotCommand 是中央平台对一次副作用 Tool Calling 保存的执行记录和当前状态快照；RobotEvent 是机器人对某次 RobotCommand 的异步执行反馈。LLM 不直接改业务状态。
 
-规划部分由 Java 维护事实，模型负责基于台账摘要做语义规划、按需查询细节。主动连接机器人后，Java 每 2 秒轮询更新状态和位置，电量取已接入的数据源，不预测未来能耗。Java 预取请求级 PlanEvidence 并直接放入 Prompt，包含展台名称、简述、主题/受众/体验标签、机器人能力和快照。Planning Agent 据此输出建议机器人及完整步骤的 TaskDraft，详细资料才通过工具检索。CREATE 按默认顺序；EDIT 在当前站完成并暂停后重新规划后半段，比如保留已完成 A、B、C，后面改为 B、D、E。Java 校验格式、真实 ID 和可计算业务规则；同一 ChatClient 和 SYSTEM 最多三次生成，只追加最新错误输出、校验错误和已检索摘要，重传上下文仍有 token 成本。description 的语义仍需人工审核。草案先选一台真实机器人，不要求现在在线空闲；审核后预约两小时，开始时按实际时间延期并复查冲突，用条件 UPDATE 原子绑定机器人。研发过程中依据实际测试逐步补充解析规则、Validator 和有限重试，具体效果用真实测试记录说明。
+规划部分由 Java 维护事实，模型负责基于台账摘要做语义规划、按需查询细节。主动连接机器人后，Java 每 2 秒轮询更新状态和位置，电量取已接入的数据源，不预测未来能耗。Java 预取请求级 PlanningEvidence 并直接放入 Prompt，包含展台名称、简述、主题/受众/体验标签、机器人能力和快照。Planning Agent 据此输出建议机器人及完整步骤的 TaskDraft，详细资料才通过工具检索。CREATE 按默认顺序；EDIT 在当前站完成并暂停后重新规划后半段，比如保留已完成 A、B、C，后面改为 B、D、E。Java 校验格式、真实 ID 和可计算业务规则；同一 ChatClient 和 SYSTEM 最多三次生成，只追加最新错误输出、校验错误和已检索摘要，重传上下文仍有 token 成本。description 的语义仍需人工审核。草案先选一台真实机器人，不要求现在在线空闲；审核后预约两小时，开始时按实际时间延期并复查冲突，用条件 UPDATE 原子绑定机器人。研发过程中依据实际测试逐步补充解析规则、Validator 和有限重试，具体效果用真实测试记录说明。
 
-执行方面，TaskExecutionService 根据正式 Plan 确定当前 Step 并构造 ExecutionContext；动作 Agent 直接选择 bot_mind Tool。Java ToolCallback 在同一次调用边界完成权限和参数校验、commandId 与 RobotCommand 留痕以及 MCP 调用。同步最终结果直接续接当前 Agent Tool Loop；只返回 `accepted` 的异步调用会暂停当前 Agent，最终 RobotEvent 到达后由 Java 更新 Command、重新评估 Step，并在需要时用新 ExecutionContext 唤醒 Agent。网络超时进入 UNKNOWN，平台按原 commandId 查询或幂等重试，仍不确定则暂停并人工接管。Outbox 只用于“记录已保存、调用尚未发出时进程崩溃”的恢复，不属于机器人能力模型。G1 侧由 bot_mind 接入 G1ControlServer，RobotController 协调导航和动作，独立 Python Worker 隔离 SDK。
+执行方面，TaskExecutionService 根据已审核的 TaskStep 列表确定当前 Step 并构造 ExecutionContext；动作 Agent 直接选择 bot_mind Tool。Java ToolCallback 在同一次调用边界完成权限和参数校验、commandId 与 RobotCommand 留痕以及 MCP 调用。同步最终结果直接续接当前 Agent Tool Loop；只返回 `accepted` 的异步调用会暂停当前 Agent，最终 RobotEvent 到达后由 Java 更新 Command、重新评估 Step，并在需要时用新 ExecutionContext 唤醒 Agent。网络超时进入 UNKNOWN，平台按原 commandId 查询或幂等重试，仍不确定则暂停并人工接管。Outbox 只用于“记录已保存、调用尚未发出时进程崩溃”的恢复，不属于机器人能力模型。G1 侧由 bot_mind 接入 G1ControlServer，RobotController 协调导航和动作，独立 Python Worker 隔离 SDK。
 
 问答部分使用共享 KnowledgeQaAgent/ChatClient 和每请求 QaTools。工具绑定 robotId、taskId、stepId、exhibitCode 和 knowledgeVersion；conversationId 以 TaskStep 隔离。模型按需选择 RAG、天气、联网或不调用工具，Java 校验本轮真实 evidenceId。Intent ChatClient 只做路由。对于 `VISIT A03` 这类业务 Step，动作 Agent 通常调用 `navigate_to → booth_show`；出现“下一站但是先别讲”等现场要求时，Java 仍确定正式下一 Step，Agent 只调整当前 Step 的 Tool 顺序和等待条件。动作 Agent 不是我主责开发的模块，但我系统梳理了它与中央平台和 G1 执行层的协作边界。
 
@@ -2143,22 +2149,22 @@ Spring Boot 模块化单体
 | 表 | 关键字段 | 关键约束 |
 |---|---|---|
 | robot | robot_id, robot_name, robot_type, business_tags, capability_codes, online_status, work_status, area_code, current_task_id, last_seen_at, control_fresh, runtime_activity, current_waypoint, battery_percent, battery_sampled_at, snapshot_updated_at | 能力来自核实配置；完整轮询更新快照；条件更新完成分配 |
-| task | task_id, requirement, status, assigned_robot_id, scheduled_at, reserved_until, actual_started_at, active_plan_id, version | version 乐观锁；预约/延期按 Robot 行串行检查区间冲突 |
-| plan | plan_id, task_id, plan_version, status, approved_by | 一个生效版本 |
-| plan_step | step_id, plan_id, sequence_no, type, target_code, description, status | plan_id + sequence_no 唯一 |
-| robot_command | command_id, robot_id, step_id, payload_hash, status, attempt_no | 同 ID 参数不可变 |
+| task | task_id, requirement, status, assigned_robot_id, scheduled_at, reserved_until, actual_started_at, approved_by, approved_at, version | version 只用于并发校验；预约/延期按 Robot 行串行检查区间冲突 |
+| task_step | step_id, task_id, sequence_no, type, target_code, description, status | task_id + sequence_no 唯一；已执行/已下发步骤不可被改线覆盖 |
+| robot_command | command_id, robot_id, step_id, tool_name, payload, payload_hash, status, attempt_no, updated_at | 同 ID 参数不可变；step_id 关联 task_step，必须与所属 Task 的机器人一致 |
 | robot_event | event_id, robot_id, command_id, type, occurred_at | event_id 唯一 |
 | command_outbox | outbox_id, command_id, status, next_attempt_at | command_id 唯一 |
 | exhibit | exhibit_code, name, summary, themes, audience_tags, experience_tags, area_code, route_id, route_order, waypoint_code, default_reception_description, required_tags, required_capability_codes, capacity, open_status, knowledge_version | capacity > 0；软偏好标签与能力要求分开维护 |
 | exhibit_allocation | allocation_id, task_id, robot_id, exhibit_code, status, queue_no | 一任务目标一条活动申请 |
-| planning_draft | draft_id, task_id, actor_id, request_json, evidence_json, draft_json, attempts_json, status, created_at | 保存请求、生成依据、原始输出和校验结果；审核应用至多一次 |
+| planning_draft | draft_id, task_id, actor_id, request_json, evidence_json, draft_json, attempts_json, status, created_at, reviewed_by, reviewed_at | 保存请求、生成依据、原始输出和校验结果；审核应用至多一次；EDIT 留存修改依据与审核人 |
 | chat_memory | conversation_id, sequence_no, role, content | 会话内序号唯一 |
 | knowledge_chunk | chunk_id, exhibit_code, knowledge_version, content, embedding | 只查发布版本 |
 | robot_registry | robot_id, base_url, credential_hash, enabled | 地址由管理员配置 |
 
 ```sql
 CREATE UNIQUE INDEX uk_event_id ON robot_event(event_id);
-CREATE UNIQUE INDEX uk_plan_step_seq ON plan_step(plan_id, sequence_no);
+CREATE UNIQUE INDEX uk_task_step_seq ON task_step(task_id, sequence_no);
+CREATE INDEX idx_command_step ON robot_command(step_id);
 CREATE INDEX idx_robot_availability
   ON robot(online_status, work_status, last_seen_at);
 CREATE INDEX idx_command_timeout ON robot_command(status, updated_at);
@@ -2168,7 +2174,9 @@ CREATE INDEX idx_memory_conversation
   ON chat_memory(conversation_id, sequence_no);
 ```
 
-本次只扩充已有表字段，不新增表。线路元数据、集合点及点位映射沿用展厅配置；审核记录中的基础 Plan 版本及完成边界保存在 evidence_json。
+以上是 V2 目标表结构和部分索引，完整建表、外键及迁移脚本仍需在实际接入时补齐，不代表已修改当前巡检库。线路元数据、集合点及点位映射沿用展厅配置；审核记录中的基础 Task.version、完成 stepId/sequenceNo、旧后缀内容保存在 evidence_json，审核后的新内容在 draft_json 中。短期规划对话不新增持久化表。
+
+主要关联：`task.assigned_robot_id → robot.robot_id`；`robot.current_task_id → task.task_id` 表示当前执行占用；`task_step.task_id → task.task_id`；`robot_command.step_id → task_step.step_id`；`robot_event.command_id → robot_command.command_id`。VISIT 的 `task_step.target_code` 引用展台编码，RETURN 使用集合点配置，WAIT/END 为空。`planning_draft.task_id` 在 CREATE 尚未形成正式 Task 时可为空，审核后关联新任务；EDIT 从生成时即关联原 Task。
 
 容量大于 1 时，分配服务在锁定展台的短事务内统计 RESERVED、OCCUPIED、UNKNOWN；WAITING 不占容量，也不是数据库长锁。
 
@@ -2180,7 +2188,7 @@ CREATED → PLANNING → PENDING_REVIEW → APPROVED → RUNNING → COMPLETED
                  └→ NEEDS_HUMAN_REVIEW
 RUNNING ↔ PAUSED_MANUAL；任意非终态 → CANCELED
 
-PlanStep:
+TaskStep:
 PENDING → READY → DISPATCHED → RUNNING → SUCCEEDED
                               ↕ WAITING_INTERACTION
 RUNNING / WAITING_INTERACTION ├→ FAILED
@@ -2267,7 +2275,7 @@ R2 请求去 B
 ### G.2 后续扩展
 
 - 事件触发重规划：展台长期不可用时自动提出后半段修改建议；正文已包含工作人员显式发起的 EDIT，不把两者混为一个功能；
-- 巡检复用：复用 Task/Plan/Step/Command 主干，巡检指标另建模；
+- 巡检复用：复用 Task/TaskStep/Command 主干，巡检指标另建模；
 - 跨楼层接力：增加换层点、能力和人工交接；
 - 动态 ETA：有真实导航和排队数据后再建模，不能由 Agent 猜。
 
