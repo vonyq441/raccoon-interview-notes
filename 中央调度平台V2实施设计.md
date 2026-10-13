@@ -45,43 +45,18 @@
 
 ### 0.4 项目完整主流程
 
-~~~text
-创建 Task
-↓ Planning Agent
-↓ TaskDraft（包含多个业务 TaskStep）
-↓ Java Validator
-↓ 人工审核并确认两小时预约
-↓ 下发前复查、按实际开始延期并原子绑定 Robot
-↓ Java TaskExecutionService 选中当前 TaskStep
-↓ 构造 ExecutionContext
-↓ 动作 Agent
-↓ tool_call：目标机器人 bot_mind Tool
-↓ Java ToolCallback 伴随记录 RobotCommand
-↓ MCP tools/call → bot_mind
-↓
-├─ 同步最终 Tool Result
-│  ↓ Java 更新 RobotCommand
-│  Result 回到当前 Agent Tool Loop
-│  ↓ Agent 可继续选择下一个 Tool
-│
-└─ 异步 ACCEPTED
-   ↓ 当前 Agent 执行暂停，机器人继续实际执行
-   RobotEvent 最终反馈
-   ↓ Java 更新 RobotCommand
-   TaskExecutionService 重新判断当前 TaskStep
-   ↓ 如需继续：新 ExecutionContext → 重新唤醒动作 Agent
+```text
+工作人员确认需求
+→ Java 查询精简台账，Planning Agent 生成 TaskDraft
+→ Java 校验，必要时有限修订
+→ 人工审核，保存 Task / TaskStep 并预约机器人
+→ 下发前复查，绑定机器人
+→ Java 选择当前 Step，动作 Agent 调用 bot_mind Tools
+→ Java 根据调用结果更新 Command、Step 和 Task
+→ 推进下一 Step，直到 Task COMPLETED
+```
 
-Step 完成
-↓ Java 将 TaskStep 标记为 SUCCEEDED
-↓ 推进下一 TaskStep
-↓ Task COMPLETED
-~~~
-
-同步分支中的 Agent Tool Loop 没有被打断；异步分支才需要 Java 在最终反馈到达后恢复当前 Step。无论采用哪条分支，Java 都不选择 `navigate_to`、`booth_show`、`play_named_action` 等具体 Tool，Tool 选择始终属于动作 Agent。
-
-记录 RobotCommand 和执行 `tools/call` 可以由同一个 Java ToolCallback / MCP Client 调用边界完成；图中的分支表达“同时产生调用记录和真实 Tool 调用”，不是把 Tool 转换成 Command 后再转换回 Tool。
-
-当前项目边界是 2 台机器人、单展厅、Spring Boot 模块化单体、PostgreSQL 和 Spring AI。bot_mind 与 g1_base 是已有机器人侧代码；本文重点说明 Java 中央平台和智能体如何组织并接入机器人。文中的“目标”“建议”“V2”表示深化设计，不能自动等同于原项目已上线能力。
+先掌握这条主线：规划见第二部分，同步/异步结果见 §1.4，机器人执行见 §4.8。
 
 ---
 
@@ -465,26 +440,19 @@ Java 选中当前 TaskStep → 动作 Agent → bot_mind Tools
 
 ## 2.3 PlanningEvidence：当前事实与未来执行分开
 
-| 信息 | 从哪里来 | 规划时怎么用 |
-|---|---|---|
-| 登记机器人、名称、型号/形态、业务标签、服务区域、能力编码 | 创建机器人时配置并核实真实能力 | 选择真实且适用的机器人；业务标签可为“接待、巡检”，能力编码可为 NAVIGATE、EXHIBIT_SHOW，不能仅凭型号推断 |
-| 电量、所在点位、在线状态、采样时间 | Java 主动连接后每 2 秒轮询形成的数据库快照 | 作为当前参考；未知保持未知，不推算未来电量或耗电量 |
-| 当前活动 Task、后续预约 | Java 业务表 | 区分“当前正在执行”与“未来已预约”，供建议和人工排期参考 |
-| 线路、展台编码/名称、开放状态、导航点映射、默认顺序 | 已建图后的展厅配置 | 用真实目标约束业务顺序；导航点由 Java/执行适配读取，模型不编造坐标 |
-| 展台简述、主题标签、适合受众、体验标签、默认接待描述 | 管理员维护的结构化展台台账 | 直接进入 Prompt，比较“小学生、科教性强、科技感强”等软偏好 |
-| 展台所需业务标签和能力编码 | 已核实的执行要求 | Java 校验机器人能否服务该展台，和主题/受众标签分开 |
-| 完整介绍、演示要求、知识依据 | 已发布的展台资料/知识库 | 摘要不足时，通过只读工具按需取相关短片段 |
-| Task.version、已完成边界、未执行 TaskStep | EDIT 时读取 Task / TaskStep | 保留历史，只生成后半段 |
+Java 在授权范围内查询一份带时间戳的 `PlanningEvidence`，作为本轮生成与自动修订的共同依据。
 
-创建草案时，`suggestedRobotId` 必须先填一台实际登记的机器人：用户指定则使用指定值；未指定则由模型在适用机器人中推荐一台。**这个字段先占位，不等于占用机器人，也不等于已经预约。**审核人可以换机器人，但换完仍要重新检查区域、标签和排期。
+| 内容 | 来源与用途 |
+|---|---|
+| 机器人身份、区域、业务标签、核实能力 | 登记台账；限制可选机器人和执行能力 |
+| 状态、电量、点位与采样时间 | 轮询快照；展示当前观测，不预测未来可用性或能耗 |
+| 当前任务与后续预约 | 业务表；辅助排期，最终预约由事务确认 |
+| 展台、线路、标签、默认描述、能力要求 | 展厅配置；提供真实候选和默认顺序 |
+| Task.version、完成边界、剩余步骤 | EDIT 时读取 Task / TaskStep；限制修改范围 |
 
-推荐时先满足配置的区域、业务标签及已知排期，再结合受众匹配展台；条件相近时可参考当前电量和当前点位与线路起点的关系。临近执行时当前快照更有参考意义，预约未来任务时不能把这些观测变成未来承诺。位置参考采用配置点位和默认线路即可，不增加能耗预测或精确耗时算法。
+用户指定机器人时使用指定值，否则推荐一台适用的登记机器人。`suggestedRobotId` 不代表预约或占用；当前离线、忙碌不阻止未来草案，立即执行仍须通过下发门禁。配置不存在或没有适用机器人时，调用模型前返回错误。
 
-当前两台机器人都离线时，仍可生成未来任务草案，并在审核页面展示“当前离线、最近同步时间”。只有没有任何适用的登记机器人、指定 ID 不存在、请求的区域未配置等情况，才在调用模型前返回明确错误。立即执行必须通过下发门禁。
-
-电量只读数据库中的当前数值及其采样时间，不预测走完整条路线需要多少电。缺失或过期要明确标注，不能当作满电。实际下发可使用现场配置的最低电量门槛；当前 `bot_mind` 状态接口若未提供电量，需补齐读取来源后才能启用该门禁，不能伪造已有字段。注册标签用于简单匹配，不根据型号名字推测技能；两台机器人的项目无需建设复杂能力推理系统。
-
-Java 在请求开始时读取一份带时间戳的 `PlanningEvidence`，查询只限本次授权区域/线路，先处理权限、区域和确定的硬限制。**展台候选摘要与机器人摘要直接序列化到 Prompt，不要求模型再调用一个返回同样整份台账的 `queryPlanningContext`。**请求级工具只在摘要不足时检索展台详细资料，不能查询其他展厅、修改数据库或采集机器人硬件状态。同一轮修订使用同一份 Evidence，避免混用不同采样时刻；下发前再读取最新状态。
+电量缺失或过期保持未知；bot_mind 未提供的字段必须补接真实来源。**精简台账直接放入 Prompt，详细知识才按需检索**，不要求模型再用工具查询同一份台账。
 
 ### 2.3.1 三类标签：偏好与能力分开
 
@@ -500,33 +468,24 @@ Java 在请求开始时读取一份带时间戳的 `PlanningEvidence`，查询�
 
 ### 2.3.2 精简台账与按需工具：各放什么
 
-基础输入包含展台编码、名称、短简述、主题/受众/体验标签、开放状态、默认顺序和能力要求；机器人包含登记身份、服务区域、核实的能力与必要状态摘要。字段用结构化 JSON 编排，资料内容是数据，不能覆盖系统指令。不要原样序列化 ORM 实体、完整讲稿、维护日志、历史执行记录或内部连接凭据。
+Prompt 只提供规划所需的 DTO 字段，不直接序列化 ORM 实体、完整讲稿或维护日志。摘要不足以判断年龄限制、互动要求等细节时，模型调用 `searchExhibitKnowledge`。
 
-如果模型需要判断“某个 VR 体验是否有低龄使用限制”，才调用 `searchExhibitKnowledge` 返回相关展台的已发布短片段。工具返回片段也进入模型上下文，**Tool Calling 本身不是 token 压缩机制**。本例每次最多返回 5 条、每条最多 800 字符，单请求累计保留最多 10 条；实际应按目标模型 tokenizer 测量并设置 token 预算。字符上限只是基础防护，不能等同于 token 数。若关键依据被摘要或截断，审核页应提供原文入口，不能把截断文本当成完整事实。
-
-在线快照是具有时效性的观测，不是对物理世界的强一致保证。Java 对任务占用的事务一致性，也不能消除机器人断网或现场变化。
+工具每次最多返回 5 条、每条最多 800 字符；本请求累计保留 10 条摘要、最多调用 12 次。摘要标明来源，截断时提供原文入口。实际 token 预算用目标 tokenizer 测量，Tool Calling 本身不会压缩返回内容；成本说明见 §2.7。
 
 ## 2.4 线路与运行中重新规划
 
-第一版使用配置好的默认接待顺序，例如 `A → B → C → D → E`。每个展台有 `routeId`、`routeOrder` 和机器人已建地图中的点位映射。CREATE 可以选择其中一部分，如 `A → C → E`，但顺序必须递增，避免模型无理由生成 `B → C → A`。Java 不计算 Nav2 的几何路径，也不做复杂 ETA 推演。
+CREATE 从配置线路中选站，按 `routeOrder` 递增，例如从 A、B、C、D、E 中选择 A、C、E。几何导航路径由机器人侧处理。
 
-“单向”指默认接待顺序，现场允许重新规划后走回前面的展台。正常执行不会自行逆行；显式进入 `EDIT_RUNNING_TASK` 后才允许改变后半段。采用最简单的边界：**C 已完成，Java 暂停推进 D，等待修改后的草案审核。**
+EDIT_RUNNING_TASK 只在当前站完成并暂停后修改：**保留已执行记录，只替换尚未下发的后半段。**
 
 ```text
-原计划：A → B → C | D → E → END
-                    已完成 | 未执行
+当前步骤：A → B → C | D → E → END
+                已完成 | 未执行
 用户要求：后面先去 B，再去 D、E
-新草案：              B → D → E → END
-新执行计划：保留 A、B、C 的执行历史，后半段替换成 B、D、E、END
+修改后：A → B → C | B → D → E → END
 ```
 
-这里的 B 仍是普通 `VISIT`，不引入“回访”类型。它与历史 B 有不同 stepId。只检查新后半段自身是否重复，不把已经完成的 B 当作不能再去的禁区。新路线需要人工确认，机器人仍需能够到达对应点位。
-
-Java 记录草案所依据的 `Task.version`、最后完成的 `stepId` 和 `sequenceNo`。审核应用时再次检查任务版本和暂停边界；若任务已继续前进，拒绝应用过时草案。只允许替换边界之后仍为 `PENDING` 且从未产生 RobotCommand 的步骤；已完成、已下发、正在执行、失败或结果未知的步骤及其 Command/Event 都不能覆盖。后续存在任何不符合条件的步骤时，整次修改拒绝，交人工处理。本文不扩展“正在讲 C 时强行中断”的实现。
-
-为保持实现简单，审核事务保留已完成前缀的行、stepId、顺序与结果，删除满足上述条件的未执行后缀，再插入审核后的新后缀。**模型的 StepDraft.sequence 是本次草案的局部序号，从 1 开始；落库的 TaskStep.sequenceNo 是任务内序号，从已完成边界之后接续。** 例如 A、B、C 已完成，边界序号为 3，新草案 B、D、E、END 的 1～4 落成任务序号 4～7，新 B 使用新 stepId；历史 B 保留原 stepId。取消的未执行内容可从本次草案记录的 evidence_json、审核内容和操作留痕追溯，不保存整份路线版本。
-
-审核修改与执行服务选择下一 Step、首次创建 RobotCommand，必须遵循同一 Task 行锁及版本检查，避免“刚检查为未执行，另一请求就下发”的竞争。步骤列表改变或执行边界推进时递增 `Task.version`；机器人状态轮询不递增它。事务内同时处理不再需要的展台候补/预约申请，不能删除真实占用。模型和机器人网络调用均在事务外，审核修改后任务保持暂停，明确继续后才下发。
+再次访问 B 使用新 stepId，历史 B 不变。Java 校验确认后的顺序和保留目标；审核事务、并发检查和落库序号集中见 §2.10.9。
 
 ## 2.5 TaskDraft、TaskStep 与默认接待描述
 
@@ -585,74 +544,33 @@ CREATE 默认按线路递增；EDIT 使用已确认的新顺序，可以重新�
 
 ## 2.7 Reviser：最多三次生成与错误处理
 
-```text
-第 1 次 Planner：A03 → A01 → A05
-Validator：ROUTE_ORDER，CREATE 应遵循默认线路
-第 2 次 Reviser：A01 → A03 → A05
-Validator：通过 → 保存 PENDING_REVIEW
-```
-
-同一个 Planning ChatClient 收到“原请求 + 本次精简 Evidence + 本请求已检索资料摘要 + 上次原始输出 + 错误列表”，重写完整 TaskDraft。首次通过立即结束；最多为 **1 次初次生成 + 2 次修订**。每次生成内部可能包含可选工具调用，所以“三次尝试”不等于最多三次底层 HTTP 请求。
+解析或业务校验不通过时，Java 将错误反馈给同一 PlanningAgent，要求重写完整 TaskDraft。首次通过立即停止，最多 **初次生成 + 两次修订**；每次内部还可能有工具往返。
 
 ### 同一个 ChatClient，同一份系统提示词，追加修订数据
 
-本例只有一个 `PlanningAgent` 持有一个 `ChatClient`。每次 `generate()` 都使用相同的 SYSTEM 和 DTO 输出 Schema；不新建 Reviser ChatClient，不切换模型或换一套系统提示词。首次的 `previousOutput` 为空、`violations` 为空；后续传入上一次输出和校验错误，SYSTEM 中已有“收到错误时修正整份草案”的规则。Reviser 是这次调用的角色，不是另一个独立 Agent。
-
-每次调用都重新构造本轮输入，不自动串入所有历史消息；只携带最新一次错误输出和错误列表。`ChatClient` 复用的是配置和调用入口，不是模型的跨请求记忆。已经查询过的资料摘要显式重放，让模型在修订时仍看到引用依据；只记录知识 ID 而不传原文摘要，不能保证模型知道对应内容。参考 [Spring AI Chat Memory 说明](https://docs.spring.io/spring-ai/reference/api/chat-memory.html)。
+客户端、SYSTEM 和输出 Schema 不变，每次输入为：
 
 ```text
-第 1 次：SYSTEM + Schema + Evidence + 请求 + []资料 + 空原输出 + []错误
-第 2 次：相同 SYSTEM/Schema/Evidence/请求 + 已检索摘要 + 输出1 + 错误1
-第 3 次：相同 SYSTEM/Schema/Evidence/请求 + 已检索摘要 + 输出2 + 错误2
+原请求 + 同一份 Evidence + 已检索摘要 + 最新输出 + 最新校验错误
 ```
+
+首次的输出为空字符串、错误为 []。后续替换最新输出和错误，不累积全部历史。Reviser 是修订时的角色，无需另建 Agent；ChatClient 复用也不意味着模型有跨请求记忆。[Spring AI 说明](https://docs.spring.io/spring-ai/reference/api/chat-memory.html)
 
 ### 每次重传台账会消耗 token 吗？
 
-会。每次模型请求仍需获得上下文，重传的系统规则、Schema、台账、请求和资料都属于输入；修订还增加上一次输出和错误信息。复用 Java 对象或保存到数据库不会自动免除这些输入成本。使用 ChatMemory 也只是帮助组织历史，不会让普通模型请求无须上下文。
+会。用精简字段、有界摘要、首次通过即停止控制成本，统计所有尝试和工具往返的用量。服务端前缀缓存仅在实际支持并命中时可能降低费用或延迟，不减少逻辑上下文长度；本例未启用缓存。[缓存说明](https://www.alibabacloud.com/help/zh/model-studio/context-cache)
 
-减少成本先做三件事：①只保留规划需要的台账字段和短简述；②首次通过立即停止，仅对可修正错误进行最多两次修订；③详细资料按需检索，避免每次累积所有旧输出及冗余片段。技术异常不要再触发内容修订循环。
-
-例如，假设固定规则、Schema 和台账合计 3,000 token，请求 200 token，上一次输出 800 token、错误 100 token：首次输入约 3,200 token，第二次约 4,100 token。第三次替换上一次输出与错误，而不是继续累积所有旧输出；若长度相同，约为 4,100 token。三次合计约 11,400 输入 token，另计输出及工具往返。这只是计算示例，实际长度、缓存命中和费用必须测量。
-
-如果实际模型服务支持前缀/KV 缓存，可把固定规则、Schema 和稳定排序的静态台账放在前部，把时间戳、实时状态、用户需求和错误放在后部，提高前缀复用机会。**缓存命中可能减少输入计算、延迟或费用，但不会减少逻辑上下文长度，也不保证命中或免费。**支持范围、有效期、计费和 `cached_tokens` 等字段以实际服务为准；当前 Java 示例没有启用或验证服务端缓存。云端服务可参考 [阿里云 Context Cache 文档](https://www.alibabacloud.com/help/zh/model-studio/context-cache)，不能直接据此声称自部署模型或旧版本网关已有相同机制。
-
-评测时记录三次尝试合计的输入、输出、命中缓存 token 和总延迟，并计入每次工具往返；不能只统计最终成功那次。具体预算用目标 tokenizer 和真实请求测量，不用“二十多个展台”直接推断成本或效果。
-
-把解析、结构和可修正业务错误反馈给模型；认证失败、网络超时、工具后端故障或数据库写入失败不伪装成“计划内容有错”。模型/工具服务不可用时本轮终止并返回明确状态，数据库失败按正常服务异常处理。错误反馈只包含错误码、字段和简短说明，不把堆栈、凭证交给模型。
-
-重试耗尽返回 `NEEDS_HUMAN_REVIEW`，保留请求、原始输出及错误；不能把最后一次错误草案当作可下发计划。默认描述可以减少无意义的自由生成，但不自动给错误路线盖章。它是有确定性反馈和上限的修订循环，可称有限反思式修订，不需要新增 Reflection Agent 框架。
+错误反馈只含错误码、字段和简短说明。网络、鉴权、工具故障和数据库失败走技术异常处理，不进入内容修订。三次仍失败则保存原始输出及错误，返回 NEEDS_HUMAN_REVIEW，不下发最后一份错误草案。
 
 ### 2.7.1 一次规划内追加修改：简单会话，不继承历史聊天
 
-工作人员觉得草案不满意，可以在**本次规划会话**中继续说“减少一站”“多一些科教内容”。这属于用户追加修改，不是 Validator 报错后的自动修订；每条追加要求都启动一次新的生成与校验，内部仍最多三次尝试。
+一次规划会话允许工作人员追加“减少一站”等要求。Java 用绑定用户的 `planningSessionId`，在短期内存中保留当前有效请求、最新有效草案和少量近期对话；不新增 ChatMemory 或 Redis。新要求只更新明确修改的部分，冲突或歧义先确认。
 
-采用简单方案：Java 按服务端生成的 `planningSessionId` 保存一份短期会话状态，绑定当前登录用户。规划链继续显式组装输入，不必为了这个场景接入 Spring AI ChatMemory 或新增 Redis。状态只保留：
+每次追加重新查询台账、创建请求级工具，生成并校验完整草案，内部仍最多三次尝试；失败时保留上一份有效草案。旧知识 ID 不自动成为本轮证据。
 
-| 会话内容 | 用途 |
-|---|---|
-| 当前有效 PlanningRequest | 保留尚未取消的受众、必到、禁入等条件；新要求只修改明确涉及的部分 |
-| 最近一份通过校验的 TaskDraft | 作为本轮微调的蓝本；自动修订失败的原始输出不能替换它 |
-| 必要的近期对话 | 理解“刚才那个”等指代；例如最多保留最近 3 轮，不保存每轮完整 JSON 草案 |
+草案照常落 PostgreSQL，短期聊天不持久化；审核、结束或超时后清理，例如无活动 30 分钟。会话过期或进程重启后可从已保存草案重新规划。§2.10 的代码只实现单次生成，未展开会话接口。
 
-页面展示当前有效要求。明确结构化条件更新到 PlanningRequest；自然语言追加要求并入当前需求，已被明确替代的旧要求移除。有歧义或约束冲突时先确认，不静默丢掉“必到 A03”等条件。后台从当前用户的会话读取蓝本，不能相信前端提交的“这份草案已通过校验”。
-
-```text
-用户追加要求
-→ 读取本会话有效请求、当前草案和必要的近期对话
-→ 确认本轮有效要求，重新查询本轮精简台账
-→ 相同 SYSTEM / Schema + 有效请求 + 当前草案 + 追加要求 + 必要对话
-→ 生成完整 TaskDraft，Java 解析、校验，最多三次尝试
-→ 通过：保存新的待审核草案，并替换会话中的当前草案
-→ 未通过：保留上一份有效草案，显示本轮错误
-```
-
-每个用户修改轮次内部使用同一份 Evidence 和请求级 PlanningTools；下一次用户追加修改时重新查询台账、创建工具实例。旧轮次的知识 ID 不自动成为本轮证据，蓝本中的描述仍须以当前资料为依据。近期对话只帮助理解要求，不能覆盖有效请求、真实台账或系统规则。
-
-会话状态可放在 Java 内存，审核完成、主动结束或一段时间无活动后回收，例如 30 分钟。草案内容、有效请求和尝试记录仍按既有 `planning_draft` 落 PostgreSQL；短期聊天不做持久化，不新增聊天归档、需求快照或会话分支表。进程重启或会话过期后，不承诺恢复原对话，可选已保存草案重新规划。此处是追加会话的设计约定；2.10 的核心代码仍展示单次生成与自动修订，尚未展开会话管理接口。
-
-**历史计划只作为全新规划的蓝本。** 用户选择历史 Task 的步骤或已保存草案时，Java 验证读取权限，创建新的 `planningSessionId`，不加载原 conversationId 或旧聊天。工作人员重新确认时间、受众、线路和其他要求；参考旧路线及接待描述，查询当前台账并重新生成、校验和审核。必要的旧条件可供用户显式勾选，不自动继承全部旧约束。旧任务状态、预约、机器人占用、审批结论和知识引用均不继承。
-
-历史蓝本入口按 `CREATE` 处理，`taskId=null`；可以记录一个可选来源 ID 供查看出处，不建立会话分支机制。审核后形成新任务，不覆盖历史任务。**这与 2.4 的 EDIT_RUNNING_TASK 不同**：后者是修改正在执行任务的未完成后半段，仍必须遵守原机器人、暂停边界和 Task.version 检查。
+**历史计划只作为全新规划的蓝本。** 创建新会话，仅参考旧步骤和描述，重新确认要求、查询台账和审核；使用 CREATE、taskId=null，不继承旧聊天、审批、预约或占用。运行中改线另走 §2.4。
 
 ## 2.8 人工审核、两小时预约与执行占用
 
@@ -1293,7 +1211,7 @@ public class PlanningExceptionHandler {
 
 ### 2.10.9 Repository 落库和审核衔接：不能省掉的实现契约
 
-学习时可向 `POST /api/planning/drafts` 提交下面的请求。身份由登录会话携带；示例中没有指定机器人，模型需在本次 Evidence 中推荐一台：
+向 `POST /api/planning/drafts` 提交请求，身份从登录会话取得。例如：
 
 ```json
 {
@@ -1312,34 +1230,36 @@ public class PlanningExceptionHandler {
 }
 ```
 
-成功返回 `draftId + PENDING_REVIEW + TaskDraft + []`，其中 TaskDraft 的形式见 2.5。EDIT 时页面填入原 taskId、机器人、原预约时间，并确认新的完整后半段 `requestedStops`；示例可为 `["B", "D", "E"]`。Controller 不执行预约或硬件调用。
+成功返回 `draftId + PENDING_REVIEW + TaskDraft + []`。EDIT 使用原 taskId、机器人和预约时间；requestedStops 非空时表示确认后的完整后半段顺序。
 
-`findRegisteredRobots` 联合读取机器人配置、快照和未释放预约：按授权展厅、区域和启用配置查询，**不要写 `WHERE online_status='ONLINE' AND work_status='IDLE'`**。电量及时间戳允许为空；旧值不抹掉，但必须显示采样时间。机器人状态采集仍按 1.2 节独立运行。
+| Repository 方法 | 实现契约 |
+|---|---|
+| findRegisteredRobots | 按授权区域和启用配置查询，带上快照与预约；不按当前 ONLINE/IDLE 排除未来候选 |
+| requireAuthorizedBoundary | 查询 Task.version、完成 stepId/sequenceNo 和剩余步骤；须已暂停且当前站完成，后续全部 PENDING、从未产生 RobotCommand |
+| saveDraft | 短事务保存请求、Evidence、草案和尝试记录到 planning_draft；JSON 参数绑定为 jsonb，失败时 draft_json 可为空 |
 
-`requireAuthorizedBoundary` 直接查询 Task 及按 sequence_no 排序的 task_step，读取绑定机器人、Task.version、最后完成的 stepId/sequenceNo 和未执行列表。只在任务已暂停、当前 Step 已完成，且后续全部为 PENDING、从未产生 RobotCommand 时返回 EditBoundary；否则明确拒绝。remainingSteps 是未执行步骤的内容快照，历史 VISIT 不放入剩余目标校验集合。查询失败或越权直接终止，不让模型替用户查别人的任务。
-
-`saveDraft` 在短事务内向现有 `planning_draft` 写入 draftId、actorId、status、request_json、evidence_json、draft_json、attempts_json；请求和 Evidence 中已经包含 EDIT 的 taskId、基础 Task.version 及完成边界。ID、创建时间由 Java/数据库提供，JSON 使用参数绑定并转为 PostgreSQL jsonb，不拼接用户字符串。失败草案的 draft_json 可为 NULL，原始输出保存在 attempts_json。原始文本只供授权审核查看，按文本渲染，不作为 HTML 执行。
-
-审核服务必须读取这条记录而非相信前端提交的“已经通过”。重新校验审核后内容及最新配置，再按操作执行：
+审核服务读取已保存草案、重新校验内容和最新配置，不信任前端传来的“已经通过”。模型和机器人网络调用在事务外。
 
 ```text
-CREATE 审核确认事务：
-锁 Robot 行 → 检查 Task 预约区间冲突
-→ 保存 Task APPROVED、直接关联 taskId 的 TaskStep（含 description）及两小时预约
-→ 将草案标记为已应用 → 提交
+CREATE 审核事务：
+锁 Robot → 检查预约冲突
+→ 保存 Task APPROVED、TaskStep 和两小时预约
+→ 标记草案已应用 → 提交
 
-EDIT 审核应用事务：
-锁 Task 行 → 核对 evidence.editBoundary.taskVersion、暂停状态和完成边界
-→ 重查后续步骤全部为 PENDING，且从未产生 RobotCommand，否则整次拒绝
-→ 保留已完成步骤及 Command/Event，只删除符合条件的未执行后缀
-→ 插入新 TaskStep：taskId 不变，sequenceNo = completedSequenceNo + 草案 sequence
-→ 更新有效需求和展台申请，Task.version 加一，记录修改人、时间与草案 ID
-→ 将草案标记为已应用，Task 保持暂停 → 提交
+EDIT 审核事务：
+锁 Task → 核对 evidence.editBoundary.taskVersion、暂停状态与完成边界
+→ 后续必须全部 PENDING 且无 Command，否则整次拒绝
+→ 保留已完成行及 Command/Event，删除未执行后缀，插入新 TaskStep
+→ sequenceNo = completedSequenceNo + 草案 sequence
+→ 更新有效需求和相关展台申请，Task.version 加一，记录审核人、时间和草案 ID
+→ 标记草案已应用，Task 保持暂停 → 提交
 ```
 
-重复点击审核只应用一次；草案状态条件更新必须与上述写入同一事务。CREATE 使用模型的局部序号作为任务内序号；EDIT 只能按完成边界接续，不能把已有 A、B、C 的序号重置。审核人、审核时间及草案关联由 Java 保存到 task/planning_draft；不新增方案版本表。执行下发另走 2.8 的状态复查与原子绑定。至此完整链条是：**模型生成内容与业务步骤，Java 校验、审核、预约和推进状态，动作 Agent 完成当前步骤的 Tool 编排。**
+StepDraft.sequence 是局部序号，CREATE 从 1 落库；EDIT 接在完成边界后，例如边界为 3，新草案 1～4 落成 4～7。已执行、已下发、失败或结果未知的步骤不可覆盖。旧后缀依据保存在 evidence_json，新内容保存在 draft_json。
 
-学习验证至少覆盖：两台离线仍可生成草案；CREATE 折返被拒；EDIT 的 B→D→E 允许且已完成步骤的 stepId/结果不变，新步骤序号接续；后续已有 Command 时整次修改拒绝；Task.version 过期或边界推进时拒绝；未知机器人/展台被拒；格式错误反馈修订；最多三次停止；description 默认模板保留；不同请求的工具证据互不串用。模型真实效果需另以现场需求回归测试，不能由代码单元测试代替。
+执行推进和首次创建 Command 也须遵循同一 Task 行锁、版本规则，避免与改线竞争；步骤列表或执行边界变化时递增 Task.version，机器人轮询不递增。草案状态更新与上述写入同事务，保证审核只应用一次。撤销无用候补/预约时不删除真实占用，明确继续后才恢复执行。
+
+验证重点：离线候选、CREATE 顺序、EDIT 历史不变及序号接续、已有 Command/过期版本拒绝、真实 ID 与能力、解析失败修订、三次停止、工具证据隔离。模型内容效果另做现场需求回归。
 
 ---
 
@@ -1560,21 +1480,15 @@ ROBOT_CONTROL / KNOWLEDGE_QA / CENTRAL_PLANNING / OTHER
 
 ### 4.8.1 动作 Agent 负责什么
 
-这条执行链只有一个机器人 Tool 决策入口：
+| 角色 | 决定什么 |
+|---|---|
+| Planning Agent | 生成业务步骤草案，人工审核后保存 TaskStep |
+| TaskExecutionService | 当前执行哪个 Step，维护状态并推进步骤 |
+| 动作 Agent | 当前 Step 使用哪些 bot_mind Tools、如何衔接 |
+| Java ToolCallback | 校验权限与参数、保存 Command、执行 MCP 调用 |
+| bot_mind | 实现机器人能力 |
 
-```text
-Planning Agent       → 生成业务步骤草案，人工审核后保存 TaskStep
-Java TaskExecutionService → 决定现在执行哪个 TaskStep
-动作 Agent           → 决定当前 Step 调用哪些 bot_mind Tools
-bot_mind             → 定义并实现具体 Tool
-Java 状态机          → 保存事实并修改 Task / Step 状态
-```
-
-TaskExecutionService 只负责查询当前正式 Step、判断是否允许开始、构造 ExecutionContext、接收 Agent 执行结果、更新 Step 状态并推进下一 Step。它不决定调用 `navigate_to`、`booth_show` 还是 `play_named_action`。
-
-每个需要机器人执行的业务 TaskStep 都由动作 Agent 根据 ExecutionContext 调用 bot_mind Tools 完成。普通 `VISIT` 因上下文简单，Agent 通常执行 `navigate_to → booth_show` 的标准组合；出现“先别讲”“到站挥手”等临时要求时，仍是同一个 Agent，只是调整 Tool 顺序和等待条件。
-
-动作 Agent 不决定已审核的 TaskStep 列表的下一 Step，也不修改 Task、TaskStep、RobotCommand 或 RobotEvent 数据。它可以通过白名单 Tool Calling 发起机器人能力调用，但不能绕过 Tool 门禁直接访问 ROS2、Unitree SDK、Shell 或任意机器人接口。
+普通 VISIT 通常采用 navigate_to → booth_show；临时要求可以改变本 Step 的调用方式，不能更换目标或修改后续步骤。
 
 ### 4.8.2 ExecutionContext
 
@@ -1654,216 +1568,44 @@ END + targetCode=null               → 不调用机器人业务 Tool，由 Java
 
 ### 4.8.3 Agent 直接 Tool Calling
 
-“动作 Agent 直接调用 bot_mind Tool”是语义定义：Agent 选择的就是 bot_mind 实际暴露的 Tool，不先生成另一套 RobotCommand 控制协议。Spring AI / Java ToolCallback 是安全和持久化边界，不是第二个机器人决策层。
+Agent 选择的就是 bot_mind 暴露的 Tool。Java 在调用边界绑定机器人、校验参数、生成 commandId 并保存 RobotCommand，再执行 MCP tools/call；Command 是调用记录，无需另一套控制协议。
 
-```text
-TaskStep S2：VISIT B05
-          ↓
-       动作 Agent
-          ↓
- tool_call：navigate_to("B05")
-          │
-          ├──── 伴随记录 ────→ RobotCommand C201
-          │                    “记录本次 Tool Calling”
-          ▼
-   MCP tools/call
-          ↓
-      R1 bot_mind
-          ↓
-       真正导航
-```
+| Tool 返回 | 处理方式 |
+|---|---|
+| 同步最终结果 | 更新 Command，结果回到当前 Agent Tool Loop，可继续调用 Tool |
+| ACCEPTED | 暂停当前 Agent；最终 RobotEvent 到达后由 Java 更新 Command，按需用新 ExecutionContext 恢复 |
 
-Java ToolCallback / MCP Client 在这个受控调用边界完成 robotId 绑定、权限检查、参数校验、commandId 生成、RobotCommand 记录和真实 `tools/call`。这些是同一次 Tool Calling 的门禁与留痕，不是“Tool → Command → Tool”的转换。
-
-动作 Agent 的正常 Tool Calling 可以在同一次框架执行中连续循环：
-
-```text
-动作 Agent
-↓ tool_call A
-Tool Result A = 最终结果
-↓ 返回当前 Agent Tool Loop
-Agent 继续推理
-↓ tool_call B
-Tool Result B = 最终结果
-↓
-Agent 返回当前 TaskStep 的执行结果
-```
-
-例如 `VISIT A03` 中，`play_named_action("wave")` 如果等待动作真正完成并返回 `SUCCEEDED`，结果会直接回到当前 Agent，Agent 可以继续调用 `booth_show(...)`。这些 Tool 都返回最终结果时，可以在同一次 Agent 执行中连续完成，`onCommandUpdated()` 不是每一步的必经入口。
-
-如果 `navigate_to("A03")` 只返回 `ACCEPTED`，导航仍在异步执行，当前 Agent Loop 必须暂停。之后等待 RobotEvent 最终反馈，由 Java 更新 Command、重新评估 Step，并在仍需继续时使用新的 ExecutionContext 重新唤醒动作 Agent。动作 Agent 不直接订阅或消费 RobotEvent。
+动作 Agent 不直接消费 RobotEvent。Java 如何归并事件、判断 Step 完成，见 §1.4。
 
 ### 4.8.4 普通 TaskStep 怎样执行
 
-正式计划给出：
+对于 T100 / R1 / S3 = VISIT A03，Java 提供目标 A03、机器人状态和执行阶段：
 
 ```text
-Task T100
-Robot R1
-TaskStep S3：VISIT A03
+动作 Agent → navigate_to(A03) → 导航完成
+          → booth_show(...) → 本站接待完成
+Java 校验整体完成条件 → S3 SUCCEEDED → 下一 Step
 ```
 
-TaskExecutionService 构造 `stepType = VISIT`、`targetCode = A03`、`temporaryInstruction = null` 的 ExecutionContext。动作 Agent 据此判断业务目标是“到 A03 并完成本站接待”，再结合机器人状态执行标准 Tool 组合。具体如何衔接取决于对应 bot_mind Tool 的真实返回语义：
-
-```text
-模式 A：navigate_to 同步返回最终结果
-
-动作 Agent → navigate_to("A03")
-→ Tool Result = SUCCEEDED
-→ Result 回到同一次 Agent Tool Loop
-→ 动作 Agent继续选择 booth_show(...)
-→ Tool Result = SUCCEEDED
-→ 动作 Agent返回：当前 VISIT 已完成
-
-模式 B：navigate_to 只返回异步受理
-
-动作 Agent → navigate_to("A03")
-→ Tool Result = ACCEPTED
-→ 当前 Agent 执行暂停
-→ RobotEvent = SUCCEEDED
-→ Java 更新 RobotCommand
-→ TaskExecutionService 重新判断 S3
-→ 新 ExecutionContext 重新唤醒动作 Agent
-→ 动作 Agent选择 booth_show(...)
-
-两种模式最终都由 Java 校验 S3 整体完成条件
-→ S3 → SUCCEEDED
-→ TaskExecutionService 选择下一正式 Step
-```
-
-正文不假定所有 Tool 都采用同一种返回模式，应以对应 bot_mind Tool 的真实接口为准。这里没有另一条“普通流程执行器”：动作 Agent 始终是唯一 Tool 决策入口；Java 只决定当前 Step、维护生命周期、提供上下文并处理异步恢复。
-
-如果同一个 Step 带有临时要求：
-
-```text
-stepType = VISIT
-targetCode = A03
-temporaryInstruction = "到了以后先别讲，先挥个手"
-
-动作 Agent：
-navigate_to("A03")
-→ 等待导航完成
-→ play_named_action("wave")
-→ 返回“等待用户继续”，暂不调用 booth_show
-
-Java：
-S3.type 仍为 VISIT
-S3.status → WAITING_INTERACTION
-
-用户说“开始讲”
-→ Java 校验当前仍是 T100 / S3 / R1 / A03
-→ 重新构造 ExecutionContext
-→ 动作 Agent 调用 booth_show(...)
-→ 讲解完成
-→ Java 校验 VISIT 整体完成条件
-→ S3.status → SUCCEEDED
-```
-
-如果上述 Tool 同步返回最终结果，Agent 可在当前 Tool Loop 中继续；如果导航只返回 `ACCEPTED`，则在 RobotEvent 到达后由 Java 用新 ExecutionContext 恢复。临时自然语言要求只改变当前 Step 的 Tool 调用方式，不改变 `TaskStep.type`、`targetCode` 或正式路线。
+各 Tool 按 §4.8.3 的同步或异步方式衔接；导航成功只代表到站，不足以完成 VISIT。Tool 选择始终由动作 Agent 负责，Java 负责状态推进。
 
 ### 4.8.5 “下一站，但是到了先别讲”怎样执行
 
-数据库中的正式计划是：
+当前 S1 = VISIT A03，下一步 S2 = VISIT B05。收到“去下一站，但是到了先别讲解”后：
 
 ```text
-S1 = VISIT A03（当前）
-S2 = VISIT B05（下一步）
-```
-
-用户说“去下一站，但是到了先别讲解”时，一句话中同时包含确定性任务控制和动态执行要求：
-
-```text
-机器人麦克风 → ASR
-→ 中央 Java / Intent 解析
-→ Java 识别 NEXT_STEP
-→ 根据已审核的 TaskStep 列表确定下一 Step = S2，targetCode = B05
-→ temporaryInstruction = "到站以后先不要讲解"
-→ TaskExecutionService 校验当前 S1 允许切换，再将 S2 设为当前活动 Step
-→ 构造 ExecutionContext(T100, S2, R1, VISIT, B05, ..., temporaryInstruction)
-→ 动作 Agent
-→ tool_call：navigate_to("B05")
-├─ 伴随记录 RobotCommand C201
-└─ MCP tools/call → R1 bot_mind
-↓
-├─ 同步 Tool Result = SUCCEEDED
-│  → Java 更新 C201
-│  → Result 回到当前 Agent Tool Loop
-│  → Agent 根据 temporaryInstruction 返回“等待现场交互”
-│
-└─ 异步 Tool Result = ACCEPTED
-   → 当前 Agent 执行暂停
-   → RobotEvent = SUCCEEDED
-   → Java 更新 C201，TaskExecutionService 重新判断 S2
-   → 新 ExecutionContext 重新唤醒动作 Agent
-   → Agent 根据 temporaryInstruction 返回“等待现场交互”
-
+Java 校验 S1 允许推进，从正式步骤确定 S2 / B05
+→ 构造 ExecutionContext，temporaryInstruction = 到站先别讲
+→ 动作 Agent 调用 navigate_to(B05)
+→ 导航完成后返回等待结果
 → Java 将 S2 更新为 WAITING_INTERACTION
 ```
 
-用户随后说“开始讲吧”时：
+随后收到“开始讲”：Java 复查当前仍是该任务、步骤、机器人和展台，动作 Agent 调用 booth_show；本站接待完成后 Java 将 S2 标记成功。同步/异步衔接沿用 §4.8.3。
 
-```text
-Java 确认 T100 / S2 / R1 / B05 仍匹配当前活动 Step
-→ 重新构造 ExecutionContext
-→ 动作 Agent tool_call：booth_show("开始讲解展台")
-├─ 伴随记录 RobotCommand C202
-└─ MCP tools/call → R1 bot_mind
-→ 同步最终 Tool Result 回到当前 Agent，或异步 Event 到达后恢复 Agent
-→ 动作 Agent 返回：当前 VISIT 已完成
-→ Java 确认 C202 已进入最终态并校验 S2
-→ VISIT B05 整体完成条件满足，S2 → SUCCEEDED
-→ TaskExecutionService 推进下一正式 Step
-```
+下一站的目标由 Java 确定，临时要求只影响当前 Step 的执行方式。失败时只能在本 Step 和允许策略内处理，不能自行改线。
 
-“去下一站”的目标 Step 由 Java 根据已审核的 TaskStep 列表确定；“到了先别讲”的执行方式由动作 Agent 理解并落实。工具失败时，Agent 只能在当前 Step 和策略允许范围内改参、停止或等待，不能改写后续路线；取消与停止仍调用 `stop_robot`、`stop_speaking` 等白名单 Tool。同步最终结果直接续接当前 Agent；只有异步执行暂停后，才由 RobotEvent 触发 Java 恢复 Step。
-
-完整心智模型如下：
-
-```text
-Planning Agent：“去哪？”
-        ↓
-已审核的 TaskStep 列表
-        ↓
-Java TaskExecutionService：“现在执行哪个 Step？”
-        ↓
-TaskStep：VISIT B05
-        ↓
-ExecutionContext
-        ↓
-动作 Agent：“这个 Step 怎么完成？”
-        ↓
-tool_call：navigate_to("B05")
-        │
-        ├──── RobotCommand C201
-        │     “记录本次副作用 Tool Calling”
-        ▼
-MCP tools/call
-        ↓
-bot_mind：“真正实现 Tool”
-        ↓
-G1 / Nav2 / TTS
-        ↓
-├─ 同步最终 Tool Result → 当前 Agent Tool Loop 继续
-│
-└─ ACCEPTED → Agent 暂停 → RobotEvent
-              ↓
-            Java 更新 RobotCommand
-              ↓
-            TaskExecutionService 重新判断 Step
-              ├─ 未完成 → 新 ExecutionContext → 重新唤醒动作 Agent
-              └─ 已完成 → Step SUCCEEDED → 下一 Step
-```
-
-```text
-Planning Agent       → 决定去哪
-Java                 → 决定现在执行哪个 Step，并维护状态
-动作 Agent           → 决定当前 Step 怎么调用机器人 Tools
-bot_mind             → 定义并执行机器人能力
-RobotCommand         → 一次副作用 Tool Calling 的执行记录
-RobotEvent           → 机器人对某次 RobotCommand 的异步执行反馈
-```
-
-面试时应如实表达：“动作 Agent 不是我主责开发的模块，但因为它与我负责的中央平台和 G1 执行模块直接协作，我后续系统梳理过它的 Tool Calling 和 ExecutionContext 机制。”
+面试中如实区分本人开发职责与后续梳理的动作 Agent 深化设计。
 
 ## 4.9 本部分小结
 
